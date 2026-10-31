@@ -113,10 +113,13 @@ pub fn strerror(errnum: libc::c_int) -> Vec<u8> {
 }
 
 /// C `create_listen_socket(port)` (`socket.c`): an `AF_INET` stream socket
-/// with `SO_REUSEADDR`, bound to `INADDR_ANY` on `port` truncated to 16 bits
-/// (C `htons`), listening with backlog `SOMAXCONN`. Like C, the socket is
+/// with `SO_REUSEADDR`, bound to `INADDR_LOOPBACK` on `port` truncated to
+/// 16 bits (C `htons`), listening with backlog `SOMAXCONN`. Like C, the socket is
 /// not close-on-exec. On failure the socket is closed and the error is the
 /// `errno` of the failed call.
+///
+/// Intentional change: C binds `INADDR_ANY`, which lets any host on the
+/// network use the forwarded device ports. Here only this host can.
 pub fn create_listen_socket(port: i32) -> io::Result<std::net::TcpListener> {
     use std::os::fd::{FromRawFd, OwnedFd};
     // SAFETY: `socket` takes plain integers and returns a new fd or -1.
@@ -132,7 +135,7 @@ pub fn create_listen_socket(port: i32) -> io::Result<std::net::TcpListener> {
     let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
     addr.sin_family = libc::AF_INET as libc::sa_family_t;
     addr.sin_port = (port as u16).to_be();
-    addr.sin_addr.s_addr = libc::INADDR_ANY.to_be();
+    addr.sin_addr.s_addr = libc::INADDR_LOOPBACK.to_be();
     // SAFETY: `fd` is a valid socket; the option and address pointers point
     // at live values of the sizes passed.
     let ok = unsafe {

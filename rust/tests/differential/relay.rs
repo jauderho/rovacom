@@ -4,8 +4,8 @@
 //! for its lines) or on a pipe, stderr piped, and is ended with SIGTERM.
 //! The device port is a mock on 127.0.0.1 that the test drives step by step
 //! ([`LiveDevice`]); the local clients connect to 127.0.0.1. The relay
-//! itself listens on INADDR_ANY (as C), on free ports picked by the test
-//! (never 6971).
+//! listens on free ports picked by the test (never 6971): C on INADDR_ANY,
+//! rovacom on 127.0.0.1 only (intentional change).
 //!
 //! Thread order is nondeterministic: the copy threads of a tunnel print in
 //! either order, and C and rovacom differ there too. Output is compared as
@@ -676,12 +676,18 @@ fn relay_device_refused() {
 /// The first local port is in use: REPORT_ERROR at line 333, the pair is
 /// skipped and the next one gets the same fd number.
 fn busy_case(bin: &Path) -> CaseResult {
-    // Held on all interfaces, as the relay binds: on macOS a 127.0.0.1
-    // listener would not block the relay's wildcard bind.
+    // Held on the address the relay binds: on macOS a 127.0.0.1 listener
+    // would not block C's wildcard bind, and a wildcard listener would not
+    // block rovacom's 127.0.0.1 bind.
     let busy_port = free_port();
+    let host = if bin == rovacom() {
+        "127.0.0.1"
+    } else {
+        "0.0.0.0"
+    };
     let busy = {
         let _fds = fd_create_lock();
-        TcpListener::bind(("0.0.0.0", busy_port)).expect("bind busy port")
+        TcpListener::bind((host, busy_port)).expect("bind busy port")
     };
     let port = free_port();
     let res = run_case(

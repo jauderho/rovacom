@@ -85,7 +85,7 @@ Commands (run in `rust/`): `cargo fmt --check`, `cargo check --all-targets --loc
 | Relay daemon refusals (`req:auth`, garbage, no reply) | preserved, verified; **intentionally changed** (B9): empty text after `got response ` | same |
 | Device closes mid-packet | **intentionally changed** (B15): tunnel ends; C spins at ~100% CPU | same |
 | Closing one side of a tunnel | **intentionally changed** (B16): `shutdown` on shared sockets; output matches C (EBADF lines emulated) | **intentionally changed** (B16): peer sees FIN at once; C waits for the peer to act |
-| Relay listens on all interfaces (INADDR_ANY) | preserved (security note I3) | same |
+| Relay listen address | **intentionally changed** (I3): 127.0.0.1 only; C listens on all interfaces | same |
 
 ## Remaining work before full replacement
 

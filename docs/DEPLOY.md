@@ -130,7 +130,7 @@ Typical commands:
 
 Put `--` before a remote command that has its own options. rovacom (like the C client) reads options anywhere on the command line, so in `rovacom run file:///bin/uname -a` it takes `-a` as its own option.
 
-The daemon carries all traffic in plain TCP. Using `-a` with a remote host sends commands, data and password hashes unencrypted; use an SSH tunnel instead. Port forwarding (`-P`) listens on **all network interfaces**, as the C client does.
+The daemon carries all traffic in plain TCP. Using `-a` with a remote host sends commands, data and password hashes unencrypted; use an SSH tunnel instead. Port forwarding (`-P`) listens on 127.0.0.1 only, so only this computer can use the forwarded ports (the C client listens on all network interfaces).
 
 ## 7. Behavior that differs by OS (same as the C client)
 

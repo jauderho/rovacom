@@ -10,7 +10,7 @@ Status: `open` · `applied-in-port` (fixed as part of the port, see ASSESSMENT �
 |---|---|---|---|---|---|
 | I1 | Security | Password via `-r` is visible in `ps` and shell history (`main.c:259`) | Read from env var or prompt / stdin pipe; deprecate `-r` | None | open |
 | I2 | Security | Auth is `SHA1(SHA1(nduid‖pw)‖session)`, unsalted SHA-1 over plaintext TCP (`main.c:prepare_cmd`) | Device-side protocol; document weakness. Only fixable together with device firmware | Yes | open |
-| I3 | Security | Port forwarding listens on `INADDR_ANY` (`socket.c:create_listen_socket`) — exposes device services to the LAN | Bind `127.0.0.1` by default; opt-in flag for all interfaces | None | open |
+| I3 | Security | Port forwarding listens on `INADDR_ANY` (`socket.c:create_listen_socket`) — exposes device services to the LAN | Bind `127.0.0.1` by default; opt-in flag for all interfaces | None | done (127.0.0.1 only; no opt-in flag) |
 | I4 | Security | Server traffic is plaintext TCP; `-a` to a remote host sends password hashes and streams unencrypted | Recommend SSH tunnel; consider refusing non-loopback `-a` without a flag | None | open |
 | I5 | Security | Uninitialized OOB padding sent on wire (B5) | Zero padding | Bytes only in reserved field | applied-in-port |
 | I6 | Security | Global buffer overflow building command from argv (B1) | Build the command without a fixed buffer (no length limit) | None | applied-in-port |

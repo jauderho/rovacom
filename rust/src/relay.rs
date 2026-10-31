@@ -431,7 +431,7 @@ mod tests {
         // 65536 truncates to port 0: any free port.
         let l = sys::create_listen_socket(65536).unwrap();
         let addr = l.local_addr().unwrap();
-        assert!(addr.ip().is_unspecified() && addr.port() != 0);
+        assert!(addr.ip().is_loopback() && addr.port() != 0);
         assert!(TcpStream::connect(("127.0.0.1", addr.port())).is_ok());
     }
 
