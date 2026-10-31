@@ -35,17 +35,11 @@ use std::time::Duration;
 
 use crate::cli::PortPair;
 use crate::net;
+use crate::packet::{HEADER_LEN, MAGIC, TYPE_DATA, TYPE_OOB, VERSION, encode_data_header};
 use crate::session;
 use crate::stdio::StdioOut;
 use crate::sys::{self, FdWriter, STDERR_FD, STDOUT_FD};
 
-/// C `PACKET_MAGIC`, `PACKET_VERSION`, packet types.
-const MAGIC: u32 = 0xdeca_fbad;
-const VERSION: u32 = 1;
-const TYPE_DATA: u32 = 0;
-const TYPE_OOB: u32 = 2;
-/// C `sizeof(PacketHeader)`.
-const HEADER_LEN: usize = 16;
 /// C `char buffer[0x2000]` of both copy threads.
 const BUFFER_LEN: usize = 0x2000;
 /// C main thread: `for (;;) { sleep(100000); }`.
@@ -339,13 +333,7 @@ fn device_to_host(relay: &Relay, t: &Tunnel) {
 /// C `sendNovacomPacket()`: a DATA header, then the data, one `send` each.
 /// `Err` is the `errno` after the reported failure.
 fn send_packet(relay: &Relay, sock: &TcpStream, data: &[u8]) -> Result<(), i32> {
-    let mut header = [0u8; HEADER_LEN];
-    for (i, word) in [MAGIC, VERSION, data.len() as u32, TYPE_DATA]
-        .into_iter()
-        .enumerate()
-    {
-        header[4 * i..4 * i + 4].copy_from_slice(&word.to_le_bytes());
-    }
+    let header = encode_data_header(data.len() as u32);
     for (buf, line) in [
         (&header[..], line::PACKET_HEADER),
         (data, line::PACKET_DATA),
