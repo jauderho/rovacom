@@ -1,0 +1,17 @@
+[package]
+name = "rovacom"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Behavior-preserving Rust port of the novacom client"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "rovacom"
+path = "src/main.rs"
+
+[dependencies]
