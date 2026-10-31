@@ -1,6 +1,16 @@
-# ghafiles
+# rovacom
 
-This contains baseline GitHub Actions that may be useful for any new project. 
+A Rust port of [novacom](https://github.com/openwebos/novacom), the host client for talking to webOS devices (such as the Palm Pre3) through a novacom daemon. rovacom keeps the C client's command line, output and wire protocol, works with `novacomd` and `rovacomd`, and also runs under the name `novacom`. Linux and macOS are both supported.
+
+- [Build, install and run](docs/DEPLOY.md)
+- [Compatibility matrix and test report](docs/STATUS.md)
+- [Assessment of the C original](docs/ASSESSMENT.md) and [improvement log](docs/IMPROVEMENTS.md)
+
+Licensed under Apache-2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+## Repository CI baseline
+
+Baseline GitHub Actions used by this repository:
 
 - Adhere to least privilege principles for workflow permissions
 - Use of commit hashes for pinning GitHub Actions dependencies

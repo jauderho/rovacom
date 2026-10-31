@@ -11,6 +11,8 @@ Last updated: 2026-10-30. Slices 1 (device listing), 2 (remote command data stre
 | Dependencies | libc 0.2.191; sha1 0.11.0 (+ block-buffer, cfg-if, cpufeatures, crypto-common, digest, hybrid-array, typenum); all MIT OR Apache-2.0 | same |
 | C reference | `scripts/build-reference.sh` (Apple clang 21.0.0), commit d9d8b77 | same script (gcc 15.3.0) |
 
+Build, install and run instructions: [DEPLOY.md](DEPLOY.md).
+
 Commands (run in `rust/`): `cargo fmt --check`, `cargo check --all-targets --locked`,
 `cargo clippy --all-targets --locked -- -D warnings`, `cargo test --all-targets --locked`.
 
@@ -88,4 +90,3 @@ Commands (run in `rust/`): `cargo fmt --check`, `cargo check --all-targets --loc
 
 1. Run CI on real runners; Linux arm64 and macOS x86_64 coverage.
 2. Interop with `rovacomd` and, with approval, read-only tests against the Pre3.
-3. Phase 5 build and deployment docs, including `novacom` alias setup without system-wide install.
