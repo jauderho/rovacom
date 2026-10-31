@@ -1,6 +1,6 @@
 # rovacom: Compatibility Matrix and Verification Report
 
-Last updated: 2026-10-30. Slices 1 (device listing), 2 (remote command data stream), 3 (`-c` control commands, password prompt) and 4 (`-t` terminal mode, `-s` signal forwarding) complete.
+Last updated: 2026-10-30. Slices 1 (device listing), 2 (remote command data stream), 3 (`-c` control commands, password prompt), 4 (`-t` terminal mode, `-s` signal forwarding) and 5 (`-P` port forwarding) complete. All C functionality is ported.
 
 ## Validation runs
 
@@ -19,9 +19,12 @@ Commands (run in `rust/`): `cargo fmt --check`, `cargo check --all-targets --loc
 | Item | macOS | Linux |
 |---|---|---|
 | fmt / check / clippy `-D warnings` | executed, passed | executed, passed |
-| Unit tests | executed, 75 passed (2 full runs) | executed, 74 passed (2 full runs; 1 test is macOS-only) |
-| Differential tests vs C (mock novacomd, merged-stream and pty tests) | executed, 55 passed (2 full runs) | executed, 55 passed (2 full runs) |
-| Harness negative checks | slice 1: wrong reference fails 18 of 20; slices 2-4: 9 deliberate code mutations each caught; slice 3: tests refuse to run with a fake wildcard listener on 6971 | not executed |
+| Full suite repeated | 4 full runs after slice 5, all passed | 6 full runs after slice 5; 1 failure (C reference flake, below), then 3 passed after the fix |
+| Unit tests | executed, 78 passed | executed, 77 passed (1 test is macOS-only) |
+| Differential tests vs C (mock novacomd, merged-stream, pty, signal and relay tests) | executed, 64 passed | executed, 64 passed |
+| Known flaky reference | `signals_forwarded`: C drops signals under load (B4): 8 of 20 runs on a loaded 2-core host, rovacom 0 of 20. The test now retries the C side up to 5 times; rovacom runs once | same |
+| Port 6971 guard false refusals (I29) | about 3 in 20 runs during slice 5; fails safe; cause unknown | not seen |
+| Harness negative checks | slice 1: wrong reference fails 18 of 20; slices 2-5: 13 deliberate code mutations each caught; slice 3: tests refuse to run with a fake wildcard listener on 6971 | not executed |
 | CI workflow (`.github/workflows/rust.yml`) | proposed, **never run** | proposed, **never run** |
 | Linux arm64, macOS x86_64 | not executed (CI jobs proposed) | not executed |
 | Real novacomd / rovacomd | blocked: none available | blocked: none available |
@@ -73,11 +76,16 @@ Commands (run in `rust/`): `cargo fmt --check`, `cargo check --all-targets --loc
 | Signals arriving while blocked on a socket write | **intentionally changed** (B4): all forwarded once, lowest first, duplicates merged; C drops them | same |
 | `-c` with `-t` / `-s` | preserved, verified | same |
 | `failed to establish pipe ` path | implemented, unverified (needs fd exhaustion) | same |
-| `-P` port forwarding | unsupported in this build (exit 70) | same |
+| `-P` relay output (`Forwarding Port`, `created service fd`, thread lines, `connect tcp-port://N` + blank line), stdout buffering | preserved, verified (thread line order is nondeterministic in both; compared as multiset + per-thread order) | same |
+| Relay data both ways (DATA chunks ≤ 0x2000), ERR dropped, OOB ends tunnel, bad packet | preserved, verified | same |
+| Relay error lines `src/tcprelay.c:<line>: <strerror>` (247, 333, ...) | preserved, verified (libc text per OS) | same |
+| Relay daemon refusals (`req:auth`, garbage, no reply) | preserved, verified; **intentionally changed** (B9): empty text after `got response ` | same |
+| Device closes mid-packet | **intentionally changed** (B15): tunnel ends; C spins at ~100% CPU | same |
+| Closing one side of a tunnel | **intentionally changed** (B16): `shutdown` on shared sockets; output matches C (EBADF lines emulated) | **intentionally changed** (B16): peer sees FIN at once; C waits for the peer to act |
+| Relay listens on all interfaces (INADDR_ANY) | preserved (security note I3) | same |
 
 ## Remaining work before full replacement
 
-1. Slice 5: `-P` / `-f` port forwarding relay.
-2. Run CI on real runners; Linux arm64 and macOS x86_64 coverage.
-3. Interop with `rovacomd` and, with approval, read-only tests against the Pre3.
-4. Phase 5 build and deployment docs, including `novacom` alias setup without system-wide install.
+1. Run CI on real runners; Linux arm64 and macOS x86_64 coverage.
+2. Interop with `rovacomd` and, with approval, read-only tests against the Pre3.
+3. Phase 5 build and deployment docs, including `novacom` alias setup without system-wide install.

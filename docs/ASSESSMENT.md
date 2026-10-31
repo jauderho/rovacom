@@ -172,6 +172,8 @@ No config files, no env vars, no runtime file paths. Only install layout comes f
 | B12 | `-c list` | Never reads the host list it requested |
 | B13 | `packet.c:172-176` | Oversized OOB packet whose extra bytes arrive in parts: `sizeof(m) - bodycounter` wraps, and `recv` writes past the static `m` (UB). Found in slice 2; rovacom discards those bytes |
 | B14 | `main.c:493-501` | `snprintf` of nduid ‖ password into the 4096-byte `command` buffer, then SHA-1 over the untruncated length: inputs over 4095 bytes read past the buffer (UB). Found in slice 3; rovacom hashes the full input |
+| B15 | `tcprelay.c:188-206` | Device closes in the middle of a packet body: `readComplete` returns 0, `send(..., 0)` succeeds, `totalRead` never advances: 100% CPU forever, local client never closed. Found in slice 5; rovacom ends the tunnel |
+| B16 | `tcprelay.c:209,258` | Each tunnel thread `close`s a socket the other thread may be blocked in `recv` on; the fd number can then be reused by a new `accept`. macOS: `close` wakes the other `recv` with EBADF. Linux: the other thread stays blocked until its peer acts. rovacom uses shared sockets and `shutdown`, emulating the macOS EBADF messages on macOS |
 
 ## 5. Proposed Rust module map
 
@@ -246,3 +248,4 @@ A Palm Pre3 (last known working unit) will be connected to the macOS host later.
 - **Password prompt visibility (slice 3):** with stdout a pipe the prompt appears after stderr messages; with stdout a tty but stdin not, the prompt appears only after the read; with stdin a tty but stdout not, echo stays on. All emulated.
 - **B4 root cause (slice 4):** the C handler `signal_to_pipe` changes `errno` itself (its non-blocking pipe `read` sets EAGAIN; its `TIOCGWINSZ` sets ENOTTY when stdout is not a tty) without saving it. `data_xfer` forwards a signal only if `errno == EINTR`, so forwarding works only when the signal interrupts `select`. Observed on macOS: with the client blocked on a socket write, C forwarded none of 8 signals and printed `data_xfer: Error reading from signal pipe: 25`.
 - **macOS `-t` and NUL (P2, slice 4):** confirmed. With the pty as controlling terminal, typing NUL kills both C and rovacom with SIGINT on macOS; on Linux NUL is passed through as data.
+- **Relay REPORT_ERROR on local EOF (slice 5):** line 247 prints `strerror(errno)` with the thread's untouched errno: `Success` on Linux, `Undefined error: 0` on macOS.
