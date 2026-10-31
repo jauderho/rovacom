@@ -1,13 +1,14 @@
 //! Unix system calls the C client makes directly: `select`, raw `read` /
 //! `write` / `close` on the standard fds, `send` without `MSG_NOSIGNAL`,
-//! the default `SIGPIPE` disposition, `isatty`, and `tcgetattr` /
-//! `tcsetattr`.
+//! the default `SIGPIPE` disposition, `isatty`, `tcgetattr` /
+//! `tcsetattr`, `TIOCGWINSZ`, and the signal self-pipe.
 //!
 //! This is the only module with `unsafe` code.
 
 use std::io;
 use std::net::TcpStream;
 use std::os::fd::{AsRawFd, RawFd};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::time::Duration;
 
 pub const STDIN_FD: RawFd = 0;
@@ -149,16 +150,191 @@ pub fn tcsetattr_now(fd: RawFd, t: &Termios) {
     }
 }
 
+/// C `ioctl(fd, TIOCGWINSZ)`: `(rows, cols)`, or `None` if the call fails
+/// (for example when `fd` is not a terminal).
+pub fn winsize(fd: RawFd) -> Option<(u16, u16)> {
+    // SAFETY: `winsize` is a plain C struct of integers; all-zero bytes are
+    // a valid value.
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: `TIOCGWINSZ` writes one `struct winsize` through the pointer,
+    // which points at a live `winsize`; an invalid fd only makes it fail.
+    let rc = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &raw mut ws) };
+    (rc == 0).then_some((ws.ws_row, ws.ws_col))
+}
+
+// ---------------------------------------------------------------------------
+// Signal forwarding (`-s`, `-t`).
+//
+// Intentional change B4: the C handler keeps a `sigset_t` in the pipe and
+// `data_xfer` reads it only when a stale `errno` is `EINTR`, so signals can
+// be dropped. Here the handler sets the signal's bit in `CAUGHT` and writes
+// one wakeup byte to the pipe; the main loop drains the pipe and takes the
+// bits, so no signal is lost. Duplicates of a signal not yet forwarded are
+// coalesced, as in a C `sigset_t`.
+// ---------------------------------------------------------------------------
+
+/// Signals caught and not yet forwarded: bit `n` is signal `n`.
+static CAUGHT: AtomicU64 = AtomicU64::new(0);
+/// Read and write ends of the self-pipe; -1 until [`signal_pipe`] has run.
+static PIPE_READ: AtomicI32 = AtomicI32::new(-1);
+static PIPE_WRITE: AtomicI32 = AtomicI32::new(-1);
+
+/// Handle to the self-pipe. Its fds stay open until the process exits,
+/// because the handlers stay installed until then.
+#[derive(Clone, Copy, Debug)]
+pub struct SignalPipe {
+    read_fd: RawFd,
+}
+
+/// Records `signo` in the caught set. Async-signal-safe (one atomic op).
+fn record_signal(signo: libc::c_int) {
+    if (0..64).contains(&signo) {
+        CAUGHT.fetch_or(1u64 << signo, Ordering::SeqCst);
+    }
+}
+
+/// The signal handler: records the signal, then wakes the main loop.
+///
+/// Only an atomic operation, `write(2)` and `errno` access (all
+/// async-signal-safe) are used. Unlike C, the window size is not read here:
+/// the main loop reads it when it forwards the SIGWINCH, which gives the
+/// same (latest) size. `errno` is saved and restored, so an interrupted
+/// call in the main loop never sees a value set by the handler.
+extern "C" fn on_signal(signo: libc::c_int) {
+    let errno = errno_location();
+    // SAFETY: `errno_location` returns the calling thread's errno slot,
+    // which is valid for the life of the thread.
+    let saved = unsafe { *errno };
+    record_signal(signo);
+    let fd = PIPE_WRITE.load(Ordering::SeqCst);
+    if fd >= 0 {
+        let byte = 1u8;
+        // SAFETY: `byte` is a live 1-byte buffer; the fd is the pipe write
+        // end, which is never closed. `write` is async-signal-safe.
+        unsafe {
+            libc::write(fd, (&raw const byte).cast(), 1);
+        }
+    }
+    // SAFETY: as above.
+    unsafe { *errno = saved };
+}
+
+/// Address of the calling thread's `errno`.
+fn errno_location() -> *mut libc::c_int {
+    // SAFETY: these libc functions take no arguments and always return the
+    // calling thread's errno address.
+    #[cfg(target_vendor = "apple")]
+    unsafe {
+        libc::__error()
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    unsafe {
+        libc::__errno_location()
+    }
+}
+
+/// Sets `O_NONBLOCK` on `fd`.
+fn set_nonblocking(fd: RawFd) -> io::Result<()> {
+    // SAFETY: `F_GETFL` / `F_SETFL` take and return plain integers; an
+    // invalid fd only makes the calls fail.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// C `pipe(signalpipe)`; both ends non-blocking (C makes only the read end
+/// non-blocking; a non-blocking write end lets the handler never block).
+/// Created once per process: later calls return the same pipe.
+pub fn signal_pipe() -> io::Result<SignalPipe> {
+    let existing = PIPE_READ.load(Ordering::SeqCst);
+    if existing >= 0 {
+        return Ok(SignalPipe { read_fd: existing });
+    }
+    let mut fds: [libc::c_int; 2] = [-1, -1];
+    // SAFETY: `fds` is a live array of two `c_int`s that `pipe` fills.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let [r, w] = fds;
+    if let Err(e) = set_nonblocking(r).and_then(|()| set_nonblocking(w)) {
+        // SAFETY: `r` and `w` were just created by `pipe` and nothing else
+        // uses them.
+        unsafe {
+            libc::close(r);
+            libc::close(w);
+        }
+        return Err(e);
+    }
+    PIPE_WRITE.store(w, Ordering::SeqCst);
+    PIPE_READ.store(r, Ordering::SeqCst);
+    Ok(SignalPipe { read_fd: r })
+}
+
+/// C `sigaction(signo, {signal_to_pipe, SA_RESTART})` for each signal. The
+/// handlers stay installed until the process exits. Errors are ignored, as
+/// in C.
+pub fn catch_signals(signals: &[libc::c_int]) {
+    for &signo in signals {
+        // SAFETY: `sigaction` is a plain C struct; all-zero bytes are a valid
+        // value (empty mask, no flags).
+        let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+        let handler: extern "C" fn(libc::c_int) = on_signal;
+        sa.sa_sigaction = handler as libc::sighandler_t;
+        sa.sa_flags = libc::SA_RESTART;
+        // SAFETY: `sa` is a live, initialized `sigaction` whose handler only
+        // performs async-signal-safe operations (see `on_signal`); the old
+        // action is not requested.
+        unsafe {
+            libc::sigaction(signo, &raw const sa, std::ptr::null_mut());
+        }
+    }
+}
+
+/// Lowest signal number in `mask`, if any.
+pub fn lowest_signal(mask: u64) -> Option<libc::c_int> {
+    (mask != 0).then(|| mask.trailing_zeros() as libc::c_int)
+}
+
+impl SignalPipe {
+    /// Reads every pending wakeup byte.
+    pub fn drain(&self) {
+        let mut buf = [0u8; 64];
+        while matches!(read(self.read_fd, &mut buf), Ok(n) if n > 0) {}
+    }
+
+    /// Takes the lowest caught signal out of the set (C processes one
+    /// signal per loop iteration, lowest number first). If more remain, a
+    /// wakeup byte is written so the main loop comes back to them, as C
+    /// writes the remaining set back to the pipe.
+    pub fn take(&self) -> Option<libc::c_int> {
+        let signo = lowest_signal(CAUGHT.load(Ordering::SeqCst))?;
+        let bit = 1u64 << signo;
+        let before = CAUGHT.fetch_and(!bit, Ordering::SeqCst);
+        if before & !bit != 0 {
+            let w = PIPE_WRITE.load(Ordering::SeqCst);
+            // A full pipe (EAGAIN) is already readable.
+            let _ = io::Write::write(&mut FdWriter(w), &[1]);
+        }
+        Some(signo)
+    }
+}
+
 /// Which fds [`select`] reported ready.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Ready {
     pub sock_read: bool,
     pub sock_write: bool,
     pub stdin_read: bool,
+    pub signal_read: bool,
 }
 
-/// C `select` over the socket (always for read; for write if `want_write`)
-/// and stdin (for read if `want_stdin`). `timeout` `None` blocks.
+/// C `select` over the socket (always for read; for write if `want_write`),
+/// stdin (for read if `want_stdin`) and the signal pipe (for read if
+/// `signals` is given). `timeout` `None` blocks.
 ///
 /// `select` is used, not `poll`, because macOS `poll(2)` does not support
 /// devices: a `/dev/null` stdin reports `POLLNVAL`, while `select` (and C)
@@ -167,17 +343,20 @@ pub fn select(
     sock: &TcpStream,
     want_stdin: bool,
     want_write: bool,
+    signals: Option<SignalPipe>,
     timeout: Option<Duration>,
 ) -> io::Result<Ready> {
     let fd = sock.as_raw_fd();
+    let sig_fd = signals.map(|p| p.read_fd);
     let setsize = RawFd::try_from(libc::FD_SETSIZE).unwrap_or(RawFd::MAX);
-    if !(0..setsize).contains(&fd) {
+    let in_range = |f: RawFd| (0..setsize).contains(&f);
+    if !in_range(fd) || !sig_fd.is_none_or(in_range) {
         return Err(io::Error::from_raw_os_error(libc::EINVAL));
     }
     let mut rfds = empty_fd_set();
     let mut wfds = empty_fd_set();
-    // SAFETY: both sets are initialized by `empty_fd_set`, and `fd` and
-    // `STDIN_FD` are within `0..FD_SETSIZE` (checked above).
+    // SAFETY: both sets are initialized by `empty_fd_set`, and `fd`,
+    // `STDIN_FD` and `sig_fd` are within `0..FD_SETSIZE` (checked above).
     unsafe {
         libc::FD_SET(fd, &raw mut rfds);
         if want_write {
@@ -186,6 +365,9 @@ pub fn select(
         if want_stdin {
             libc::FD_SET(STDIN_FD, &raw mut rfds);
         }
+        if let Some(s) = sig_fd {
+            libc::FD_SET(s, &raw mut rfds);
+        }
     }
     let mut tv = timeout.map(|t| libc::timeval {
         tv_sec: t.as_secs().try_into().unwrap_or(libc::time_t::MAX),
@@ -193,11 +375,12 @@ pub fn select(
         tv_usec: t.subsec_micros() as libc::suseconds_t,
     });
     let tv_ptr = tv.as_mut().map_or(std::ptr::null_mut(), std::ptr::from_mut);
-    // SAFETY: the sets are initialized and hold only fds below `fd + 1`;
-    // the timeout pointer is null or points at a live `timeval`.
+    let nfds = fd.max(STDIN_FD).max(sig_fd.unwrap_or(0)) + 1;
+    // SAFETY: the sets are initialized and hold only fds below `nfds`; the
+    // timeout pointer is null or points at a live `timeval`.
     let n = unsafe {
         libc::select(
-            fd.max(STDIN_FD) + 1,
+            nfds,
             &raw mut rfds,
             &raw mut wfds,
             std::ptr::null_mut(),
@@ -213,6 +396,7 @@ pub fn select(
             sock_read: libc::FD_ISSET(fd, &raw const rfds),
             sock_write: want_write && libc::FD_ISSET(fd, &raw const wfds),
             stdin_read: want_stdin && libc::FD_ISSET(STDIN_FD, &raw const rfds),
+            signal_read: sig_fd.is_some_and(|s| libc::FD_ISSET(s, &raw const rfds)),
         })
     }
 }
@@ -238,13 +422,73 @@ mod tests {
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (mut server, _) = listener.accept().unwrap();
         let short = Some(Duration::from_millis(1));
-        let r = select(&client, false, true, short).unwrap();
+        let r = select(&client, false, true, None, short).unwrap();
         assert!(r.sock_write && !r.sock_read && !r.stdin_read);
-        let r = select(&client, false, false, short).unwrap();
+        let r = select(&client, false, false, None, short).unwrap();
         assert_eq!(r, Ready::default());
         server.write_all(b"x").unwrap();
-        let r = select(&client, false, false, None).unwrap();
+        let r = select(&client, false, false, None, None).unwrap();
         assert!(r.sock_read && !r.sock_write);
+    }
+
+    #[test]
+    fn lowest_signal_number() {
+        assert_eq!(lowest_signal(0), None);
+        assert_eq!(lowest_signal(1 << 15 | 1 << 2), Some(2));
+        assert_eq!(lowest_signal(1 << 63), Some(63));
+    }
+
+    /// The only test that touches the process-wide caught set and pipe.
+    #[test]
+    fn caught_signals_lowest_first_and_coalesced() {
+        let pipe = signal_pipe().unwrap();
+        assert_eq!(signal_pipe().unwrap().read_fd, pipe.read_fd);
+        pipe.drain();
+        assert_eq!(pipe.take(), None);
+        for signo in [
+            libc::SIGTERM,
+            libc::SIGWINCH,
+            libc::SIGHUP,
+            libc::SIGTERM,
+            libc::SIGINT,
+        ] {
+            record_signal(signo);
+        }
+        record_signal(-1);
+        record_signal(64);
+        let mut taken = Vec::new();
+        while let Some(s) = pipe.take() {
+            taken.push(s);
+            // A wakeup byte is left for the rest, none after the last one.
+            let readable = select_signal_only(pipe);
+            assert_eq!(readable, taken.len() < 4, "after {taken:?}");
+            pipe.drain();
+        }
+        assert_eq!(
+            taken,
+            [libc::SIGHUP, libc::SIGINT, libc::SIGTERM, libc::SIGWINCH]
+        );
+
+        // A real signal: the handler records it and writes a wakeup byte.
+        catch_signals(&[libc::SIGWINCH]);
+        // SAFETY: `raise` with a valid signal whose handler is installed.
+        unsafe {
+            libc::raise(libc::SIGWINCH);
+            libc::raise(libc::SIGWINCH);
+        }
+        assert!(select_signal_only(pipe));
+        pipe.drain();
+        assert!(!select_signal_only(pipe));
+        assert_eq!(pipe.take(), Some(libc::SIGWINCH));
+        assert_eq!(pipe.take(), None);
+    }
+
+    /// Whether the signal pipe is readable right now.
+    fn select_signal_only(pipe: SignalPipe) -> bool {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let r = select(&client, false, false, Some(pipe), Some(Duration::ZERO)).unwrap();
+        r.signal_read
     }
 
     #[test]
@@ -267,5 +511,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         assert!(!isatty(listener.as_raw_fd()));
         assert!(tcgetattr(listener.as_raw_fd()).is_none());
+        assert_eq!(winsize(-1), None);
+        assert_eq!(winsize(listener.as_raw_fd()), None);
     }
 }

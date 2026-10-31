@@ -28,7 +28,7 @@ const CTRL_HOST: &str = "127.0.0.1";
 /// The mock reads until the client has been quiet this long.
 const QUIET: Duration = Duration::from_millis(200);
 /// Upper bound for waiting on pty output.
-const PTY_TIMEOUT: Duration = Duration::from_secs(10);
+pub(super) const PTY_TIMEOUT: Duration = Duration::from_secs(10);
 
 static CTRL_LOCK: Mutex<()> = Mutex::new(());
 
@@ -137,7 +137,7 @@ fn status_string(status: ExitStatus) -> String {
     }
 }
 
-fn wait_child(child: &mut std::process::Child, what: &str) -> String {
+pub(super) fn wait_child(child: &mut std::process::Child, what: &str) -> String {
     let deadline = Instant::now() + RUN_TIMEOUT;
     loop {
         if let Some(s) = child.try_wait().expect("wait") {
@@ -153,17 +153,18 @@ fn wait_child(child: &mut std::process::Child, what: &str) -> String {
 
 const NDUID: &str = "FEDCBA9876543210FEDCBA9876543210FEDCBA98";
 /// Device with a session id; its port is never used by `-c`.
-const SESS: &[u8] = b"7000 FEDCBA9876543210FEDCBA9876543210FEDCBA98 tcp Topaz-Linux sess123456\n";
+pub(super) const SESS: &[u8] =
+    b"7000 FEDCBA9876543210FEDCBA9876543210FEDCBA98 tcp Topaz-Linux sess123456\n";
 const NOSESS: &[u8] = b"7000 0123456789abcdef0123456789abcdef01234567 usb castle-linux\n";
 /// `hex(SHA1(hex(SHA1(NDUID "secret")) "sess123456"))`, computed with `shasum -a 1`.
 const SECRET_HASH: &str = "3d43c4aba217ee365d9bdd4af58f0a3a83d16797";
 
-fn auth_cmd(name: &str) -> Vec<u8> {
+pub(super) fn auth_cmd(name: &str) -> Vec<u8> {
     format!("{name} dev://{NDUID} {SECRET_HASH}").into_bytes()
 }
 
 /// `-a 127.0.0.1 -p {P}` followed by `args`.
-fn ctrl_args(args: &[&str], port: u16) -> Vec<Vec<u8>> {
+pub(super) fn ctrl_args(args: &[&str], port: u16) -> Vec<Vec<u8>> {
     let mut parts = vec!["-a", CTRL_HOST, "-p", "{P}"];
     parts.extend_from_slice(args);
     argv(&parts, port)
@@ -434,21 +435,25 @@ fn ctrl_refused() {
     fails(&outcomes[1], "failed to connect to server\n");
 }
 
-/// `-c` with `-t` or `-s` is not implemented yet (C would connect).
+/// `-c` with `-t` or `-s` (stdin and stdout not terminals, so `-t` changes
+/// nothing): the signal pipe is set up, then the command is sent and the
+/// client exits after the response. See also `terminal::ctrl_terminal_mode`.
 #[test]
-fn ctrl_with_terminal_or_signals_rust_only() {
-    for (args, what) in [
-        (&["-c", "login", "-t"][..], "terminal mode"),
-        (&["-s", "-c", "list"], "signal forwarding"),
-        (&["-ts", "-c", "bogus"], "terminal mode"),
+fn ctrl_with_terminal_or_signals() {
+    for (args, err) in [
+        (&["-c", "login", "-r", "secret", "-t"][..], ""),
+        (&["-s", "-c", "list"], ""),
+        (&["-ts", "-c", "bogus"], "unsupported command(bogus)\n"),
     ] {
-        let (o, sent) = ctrl_run(&rovacom(), &[SESS], args, b"", Some(b"ok\n"));
-        assert_eq!(o.status, "exit 70");
-        assert_eq!(
-            o.stderr,
-            format!("rovacom: {what} is not implemented in this build\n").into_bytes()
-        );
-        assert!(o.stdout.is_empty() && sent.is_empty());
+        let (o, sent) = ctrl_check(&[SESS], args, b"", Some(b"ok\n"));
+        if err.is_empty() {
+            ok(&o);
+            assert_eq!(sent.len(), 1, "{args:?}");
+        } else {
+            fails(&o, err);
+            assert!(sent.is_empty());
+        }
+        assert!(o.stdout.is_empty());
     }
 }
 
@@ -601,7 +606,7 @@ fn merged_streams() {
 // ---------------------------------------------------------------------------
 
 /// Opens a pty pair; both fds are close-on-exec.
-fn openpty() -> (File, File) {
+pub(super) fn openpty() -> (File, File) {
     // openpty fds are inheritable until replaced by close-on-exec dups.
     let _fds = fd_create_lock();
     let (mut master, mut slave): (libc::c_int, libc::c_int) = (-1, -1);
@@ -628,7 +633,7 @@ fn openpty() -> (File, File) {
 }
 
 /// `stty -g` of the terminal `tty`.
-fn stty(tty: &File) -> String {
+pub(super) fn stty(tty: &File) -> String {
     let mut cmd = Command::new("stty");
     cmd.arg("-g").stdin(tty.try_clone().expect("clone tty"));
     let out = {
@@ -656,7 +661,7 @@ struct PtyOutcome {
 /// `stty -g` text with PENDIN cleared on macOS. After B6 has cleared
 /// ICANON, restoring a canonical mode makes the BSD kernel set PENDIN
 /// (reprint pending input); C and rovacom both leave it set.
-fn without_pendin(stty_g: &str) -> String {
+pub(super) fn without_pendin(stty_g: &str) -> String {
     if !cfg!(target_os = "macos") {
         return stty_g.to_string();
     }

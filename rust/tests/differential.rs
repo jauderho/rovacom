@@ -8,6 +8,8 @@
 
 #[path = "differential/control.rs"]
 mod control;
+#[path = "differential/terminal.rs"]
+mod terminal;
 
 use std::ffi::OsString;
 use std::fmt;
@@ -593,26 +595,23 @@ fn port_forward_odd_count_rust_only() {
     }
 }
 
-/// Paths outside the implemented slices (C would connect to the device
-/// port) are checked against rovacom only.
+/// Port forwarding is not implemented yet (C would start the relay), so it
+/// is checked against rovacom only.
 #[test]
 fn not_implemented_rust_only() {
-    for (extra, what) in [
-        (&["-t", "run", "file:///bin/true"][..], "terminal mode"),
-        (&["-s", "run", "file:///bin/true"][..], "signal forwarding"),
-        (&["-P"][..], "port forwarding"),
-    ] {
-        let mock = Mock::start(&[BASIC]);
-        let mut parts = vec!["-p", "{P}"];
-        parts.extend_from_slice(extra);
-        let o = run(&rovacom(), "rovacom", &argv(&parts, mock.port), false);
-        assert_eq!(o.status, "exit 70");
-        assert!(o.stdout.is_empty());
-        assert_eq!(
-            o.stderr,
-            format!("rovacom: {what} is not implemented in this build\n").into_bytes()
-        );
-    }
+    let mock = Mock::start(&[BASIC]);
+    let o = run(
+        &rovacom(),
+        "rovacom",
+        &argv(&["-p", "{P}", "-P"], mock.port),
+        false,
+    );
+    assert_eq!(o.status, "exit 70");
+    assert!(o.stdout.is_empty());
+    assert_eq!(
+        o.stderr,
+        b"rovacom: port forwarding is not implemented in this build\n"
+    );
 }
 
 static ALIAS_DIR_SEQ: AtomicUsize = AtomicUsize::new(0);
@@ -688,7 +687,8 @@ const OOB_EOF: u32 = 0;
 const OOB_SIGNAL: u32 = 1;
 const OOB_RETURN: u32 = 2;
 const OOB_RESIZE: u32 = 3;
-/// Header + meaningful OOB bytes (message + first union word).
+/// Meaningful OOB body bytes (message + first union word); RESIZE also
+/// uses the second word.
 const OOB_MEANINGFUL: usize = 8;
 /// Read timeout of the mock device connection (guards against hangs).
 const MOCK_IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -761,9 +761,14 @@ fn split_padding(sent: &[u8]) -> (Vec<u8>, Vec<u8>) {
         let size = u32::from_le_bytes(rest[8..12].try_into().expect("4 bytes")) as usize;
         let kind = u32::from_le_bytes(rest[12..16].try_into().expect("4 bytes"));
         let end = (16 + size).min(rest.len());
-        if kind == T_OOB && end >= 16 + OOB_MEANINGFUL {
-            meaningful.extend_from_slice(&rest[..16 + OOB_MEANINGFUL]);
-            padding.extend_from_slice(&rest[16 + OOB_MEANINGFUL..end]);
+        let used = if rest.get(16..20) == Some(&OOB_RESIZE.to_le_bytes()[..]) {
+            OOB_MEANINGFUL + 4
+        } else {
+            OOB_MEANINGFUL
+        };
+        if kind == T_OOB && end >= 16 + used {
+            meaningful.extend_from_slice(&rest[..16 + used]);
+            padding.extend_from_slice(&rest[16 + used..end]);
         } else {
             meaningful.extend_from_slice(&rest[..end]);
         }

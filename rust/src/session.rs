@@ -1,4 +1,4 @@
-//! Remote command session: C `parse_response` and `data_xfer` (non-tty path).
+//! Remote command session: C `parse_response` and `data_xfer`.
 //!
 //! stdin, stdout and stderr are used as raw fds 0, 1 and 2 (no std
 //! buffering): buffered stdin would hide data from `select`, and bytes held in
@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use crate::devlist::{c_str, read_line};
 use crate::packet::{self, Decoder, HEADER_LEN, Recv};
-use crate::sys::{self, FdWriter, STDERR_FD, STDIN_FD, STDOUT_FD};
+use crate::sys::{self, FdWriter, STDERR_FD, STDIN_FD, STDOUT_FD, SignalPipe};
 
 /// C `response_buf[2048]`.
 const RESPONSE_BUFLEN: usize = 2048;
@@ -60,10 +60,33 @@ struct Pending {
     written: usize,
 }
 
-/// Emulates C `data_xfer` without terminal or signal forwarding.
+/// Window size sent in RESIZE packets (C static `winsize`, zero at start).
+/// Updated only when `TIOCGWINSZ` on fd 1 succeeds.
+#[derive(Clone, Copy, Default)]
+struct WinSize {
+    rows: u16,
+    cols: u16,
+}
+
+impl WinSize {
+    /// C `handle_winsize_change`.
+    fn update(&mut self) {
+        if let Some((rows, cols)) = sys::winsize(STDOUT_FD) {
+            *self = Self { rows, cols };
+        }
+    }
+
+    fn packet(self) -> [u8; packet::OOB_PACKET_LEN] {
+        packet::encode_resize(self.rows.into(), self.cols.into())
+    }
+}
+
+/// Emulates C `data_xfer`. With `signals` (`-s` or `-t`), a RESIZE packet
+/// with the window size of fd 1 is sent first, and caught signals are
+/// forwarded (see [`SignalPipe`]).
 ///
 /// Returns the remote return code, or -1 on abnormal termination.
-pub fn data_xfer(sock: &TcpStream) -> i32 {
+pub fn data_xfer(sock: &TcpStream, signals: Option<SignalPipe>) -> i32 {
     // C ignores a failing fcntl here.
     let _ = sock.set_nonblocking(true);
     let mut out = FdWriter(STDOUT_FD);
@@ -74,14 +97,26 @@ pub fn data_xfer(sock: &TcpStream) -> i32 {
     let mut stdout_closed = false;
     let mut wbuf = vec![0u8; HEADER_LEN + MAX_PACKET_PAYLOAD];
     let mut pending: Option<Pending> = None;
+    let mut winsize = WinSize::default();
+    if signals.is_some() {
+        winsize.update();
+        wbuf[..packet::OOB_PACKET_LEN].copy_from_slice(&winsize.packet());
+        pending = Some(Pending {
+            len: packet::OOB_PACKET_LEN,
+            written: 0,
+        });
+    }
 
     loop {
         let want_write = pending.is_some();
         let want_stdin = !want_write && listen_stdio;
+        // The signal pipe is watched only while no packet is pending, as in C.
+        let want_signals = signals.filter(|_| !want_write);
         // C uses a zero timeout (a busy loop) when stdin is not watched;
-        // blocking instead has the same observable behavior.
+        // blocking instead has the same observable behavior (a caught
+        // signal makes the pipe readable or interrupts `select`).
         let timeout = want_stdin.then_some(STDIN_POLL_TIMEOUT);
-        let ready = match sys::select(sock, want_stdin, want_write, timeout) {
+        let ready = match sys::select(sock, want_stdin, want_write, want_signals, timeout) {
             Ok(r) => r,
             Err(e)
                 if matches!(
@@ -146,6 +181,29 @@ pub fn data_xfer(sock: &TcpStream) -> i32 {
 
         if pending.is_some() {
             continue;
+        }
+
+        if let (true, Some(pipe)) = (ready.signal_read, signals) {
+            pipe.drain();
+            // One signal per iteration; the others come back through the
+            // pipe (see `SignalPipe::take`).
+            if let Some(signo) = pipe.take() {
+                let p = if signo == libc::SIGWINCH {
+                    // C reads the size in its handler; reading it here
+                    // gives the same latest size.
+                    winsize.update();
+                    winsize.packet()
+                } else {
+                    // Signal numbers are positive.
+                    packet::encode_signal(signo.unsigned_abs())
+                };
+                wbuf[..packet::OOB_PACKET_LEN].copy_from_slice(&p);
+                pending = Some(Pending {
+                    len: packet::OOB_PACKET_LEN,
+                    written: 0,
+                });
+                continue;
+            }
         }
 
         if ready.stdin_read {

@@ -11,7 +11,7 @@ use crate::devlist::{self, FoundDevice};
 use crate::net;
 use crate::session;
 use crate::stdio::StdioOut;
-use crate::sys::{self, FdReader, FdWriter, STDERR_FD, STDIN_FD, STDOUT_FD};
+use crate::sys::{self, FdReader, FdWriter, STDERR_FD, STDIN_FD, STDOUT_FD, SignalPipe};
 
 /// Delay between `-w` retries (C `usleep(500000)`).
 const WAIT_RETRY_DELAY: Duration = Duration::from_millis(500);
@@ -102,9 +102,8 @@ fn run_parsed(opts: Options, argv0: &[u8], out: &mut dyn Write, err: &mut dyn Wr
     after_device_found(opts, &device, argv0, out, err)
 }
 
-/// Everything after a device is found. This is the single boundary for
-/// paths not implemented yet: port forwarding, terminal mode and signal
-/// forwarding (also with `-c`).
+/// Everything after a device is found. Port forwarding is the only path
+/// not implemented yet.
 fn after_device_found(
     mut opts: Options,
     device: &FoundDevice,
@@ -112,22 +111,48 @@ fn after_device_found(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> u8 {
-    let what: &[u8] = if opts.port_forward {
-        b"port forwarding"
+    if opts.port_forward {
+        let _ = err.write_all(
+            &[
+                argv0,
+                b": port forwarding is not implemented in this build\n",
+            ]
+            .concat(),
+        );
+        NOT_IMPLEMENTED_EXIT
     } else if opts.cmd.is_none() && opts.operands.is_empty() {
         let _ = out.write_all(&cli::usage_text(argv0));
-        return 1;
-    } else if opts.term_mode {
-        b"terminal mode"
-    } else if opts.signals {
-        b"signal forwarding"
+        1
     } else if let Some(cmd) = opts.cmd.take() {
-        return control_command(&cmd, opts, device, out, err);
+        control_command(&cmd, opts, device, out, err)
     } else {
-        return remote_command(&opts, device, err);
+        remote_command(&opts, device, err)
+    }
+}
+
+/// C `main()` between connecting and sending the command: `-t` puts the
+/// console into terminal mode, then with `-t` or `-s` the signal pipe is
+/// created and the handlers are installed (SIGWINCH for both; SIGINT,
+/// SIGHUP, SIGQUIT and SIGTERM for `-s`). `Err` is the exit code.
+fn prepare_session(opts: &Options, err: &mut dyn Write) -> Result<Option<SignalPipe>, u8> {
+    if opts.term_mode {
+        console::set_mode(Mode::TermSupport);
+    }
+    if !(opts.signals || opts.sigwinch) {
+        return Ok(None);
+    }
+    // Not reachable in tests: `pipe` fails only when fds run out.
+    let Ok(pipe) = sys::signal_pipe() else {
+        let _ = err.write_all(b"failed to establish pipe \n");
+        return Err(1);
     };
-    let _ = err.write_all(&[argv0, b": ", what, b" is not implemented in this build\n"].concat());
-    NOT_IMPLEMENTED_EXIT
+    if opts.sigwinch {
+        sys::catch_signals(&[libc::SIGWINCH]);
+    }
+    if opts.signals {
+        sys::catch_signals(&[libc::SIGINT, libc::SIGHUP, libc::SIGQUIT, libc::SIGTERM]);
+    }
+    Ok(Some(pipe))
 }
 
 /// C `main()` `-c` branch: builds the control command, sends it to
@@ -152,6 +177,11 @@ fn control_command(
         let _ = err.write_all(b"failed to connect to server\n");
         return 1;
     };
+    // The signal pipe is set up as in C, but never read: C exits after
+    // the response.
+    if let Err(code) = prepare_session(&opts, err) {
+        return code;
+    }
     send_command(&sock, &command, err);
     match session::parse_response(&mut &sock) {
         Ok(()) => 0,
@@ -196,20 +226,24 @@ fn send_command(sock: &TcpStream, command: &[u8], err: &mut dyn Write) {
     }
 }
 
-/// C `main()` from building the command to the end, without `-t`/`-s`.
-/// The data stream uses the process fds 0, 1 and 2 directly.
+/// C `main()` from building the command to the end. The data stream uses
+/// the process fds 0, 1 and 2 directly.
 fn remote_command(opts: &Options, device: &FoundDevice, err: &mut dyn Write) -> u8 {
     let command = session::build_command(&opts.operands);
     let Some(sock) = net::connect_socket(&opts.server_host, device.port) else {
         let _ = err.write_all(b"failed to connect to server\n");
         return 1;
     };
+    let signals = match prepare_session(opts, err) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
     send_command(&sock, &command, err);
     if let Err(msg) = session::parse_response(&mut &sock) {
         let _ = err.write_all(&msg);
         return 1;
     }
-    let rc = session::data_xfer(&sock);
+    let rc = session::data_xfer(&sock, signals);
     if rc != 0 {
         let _ = err.write_all(b"novacom: unexpected EOF from server\n");
     }
@@ -254,15 +288,12 @@ mod tests {
     const ONE: &[u8] = b"6970 n1 usb castle\n";
 
     /// `-c` cases connect to port 6971 and are tested only in
-    /// `tests/differential.rs`, which first binds that port itself.
+    /// `tests/differential.rs`, which first binds that port itself. `-t` and
+    /// `-s` would change the test process's console and signal handlers;
+    /// they are tested there too, in child processes.
     #[test]
     fn not_implemented_paths() {
-        for (extra, what) in [
-            (&["-t", "run", "file:///bin/ls"][..], "terminal mode"),
-            (&["-s", "run"][..], "signal forwarding"),
-            (&["-ts", "run"][..], "terminal mode"),
-            (&["-P"][..], "port forwarding"),
-        ] {
+        for extra in [&["-P"][..], &["-ts", "-P", "run"]] {
             let port = serve(ONE, 1).to_string();
             let mut args = vec!["-a", "127.0.0.1", "-p", &port];
             args.extend_from_slice(extra);
@@ -271,7 +302,7 @@ mod tests {
             assert!(out.is_empty());
             assert_eq!(
                 err,
-                format!("prog: {what} is not implemented in this build\n").into_bytes()
+                b"prog: port forwarding is not implemented in this build\n"
             );
         }
     }
