@@ -177,7 +177,7 @@ No config files, no env vars, no runtime file paths. Only install layout comes f
 
 ## 5. Proposed Rust module map
 
-Single Cargo package `rust/`, crate `rovacom` (binary `rovacom` + internal lib for tests). Edition 2024, std threads, no async.
+Single Cargo package at the repository root, crate `rovacom` (binary `rovacom` + internal lib for tests). Edition 2024, std threads, no async.
 
 | Rust module | Ports | Shared / platform |
 |---|---|---|

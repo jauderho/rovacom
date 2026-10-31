@@ -51,7 +51,7 @@ fn fd_create_lock() -> RwLockWriteGuard<'static, ()> {
 
 fn reference() -> PathBuf {
     let path = std::env::var_os("ROVACOM_REFERENCE").map_or_else(
-        || Path::new(env!("CARGO_MANIFEST_DIR")).join("../reference/novacom/build-novacom/novacom"),
+        || Path::new(env!("CARGO_MANIFEST_DIR")).join("reference/novacom/build-novacom/novacom"),
         PathBuf::from,
     );
     assert!(

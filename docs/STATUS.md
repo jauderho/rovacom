@@ -13,7 +13,7 @@ Last updated: 2026-10-30. Slices 1 (device listing), 2 (remote command data stre
 
 Build, install and run instructions: [DEPLOY.md](DEPLOY.md).
 
-Commands (run in `rust/`): `cargo fmt --check`, `cargo check --all-targets --locked`,
+Commands (run in the repository root): `cargo fmt --check`, `cargo check --all-targets --locked`,
 `cargo clippy --all-targets --locked -- -D warnings`, `cargo test --all-targets --locked`.
 
 ## Verification report

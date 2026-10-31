@@ -28,10 +28,10 @@ rustup component add rustfmt clippy
 From the repository root:
 
 ```bash
-cargo build --release --locked --manifest-path rust/Cargo.toml
+cargo build --release --locked
 ```
 
-The binary is `rust/target/release/rovacom` (about 0.4 MB on macOS, 0.6 MB on Linux). To set the version string it prints for `-V`, build with `BUILDVERSION=<text>` in the environment; the default is `rovacom-<crate version>`.
+The binary is `target/release/rovacom` (about 0.4 MB on macOS, 0.6 MB on Linux). To set the version string it prints for `-V`, build with `BUILDVERSION=<text>` in the environment; the default is `rovacom-<crate version>`.
 
 ## 3. Test
 
@@ -44,7 +44,7 @@ scripts/build-reference.sh
 Then run the same checks as CI:
 
 ```bash
-cd rust && cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --all-targets --locked
+cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --all-targets --locked
 ```
 
 The tests use only mock daemons on 127.0.0.1. The suite takes about 35 seconds.
@@ -55,7 +55,7 @@ The tests use only mock daemons on 127.0.0.1. The suite takes about 35 seconds.
 ## 4. Run without installing
 
 ```bash
-rust/target/release/rovacom -l
+target/release/rovacom -l
 ```
 
 ## 5. Install for your user, with the `novacom` name
@@ -65,7 +65,7 @@ Existing tools and scripts (the Palm SDK `palm-*` tools, `novaterm`) run `novaco
 **Linux** (`~/.local/bin` is on `PATH` by default on Ubuntu):
 
 ```bash
-cargo install --path rust --locked --root ~/.local
+cargo install --path . --locked --root ~/.local
 ```
 
 ```bash
@@ -75,7 +75,7 @@ ln -sf rovacom ~/.local/bin/novacom
 **macOS** (`~/.local/bin` is not on `PATH` by default; add it to your shell profile, for example `~/.zshrc`):
 
 ```bash
-cargo install --path rust --locked --root ~/.local
+cargo install --path . --locked --root ~/.local
 ```
 
 ```bash
