@@ -1,20 +1,21 @@
 //! Differential tests: run the C reference `novacom` and `rovacom` with the
-//! same arguments against the same mock device-list server and compare exit
-//! status, stdout and stderr byte for byte.
+//! same arguments against the same mock servers and compare exit status,
+//! stdout and stderr byte for byte. Session cases also compare the bytes the
+//! client sent to the mock device port.
 //!
-//! Only mock servers on 127.0.0.1 are used; no case lets either binary go
-//! past device selection into a device connection.
+//! Only mock servers on 127.0.0.1 are used.
 
 use std::ffi::OsString;
 use std::fmt;
+use std::fs::File;
 use std::io::{Read, Write};
-use std::net::{Shutdown, TcpListener};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -127,12 +128,59 @@ fn spawn_reader<R: Read + Send + 'static>(mut r: R) -> JoinHandle<Vec<u8>> {
     })
 }
 
+/// How the child's stdout is consumed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StdoutMode {
+    /// Read as fast as possible.
+    Normal,
+    /// Read in small chunks with pauses, so the pipe fills up.
+    Slow,
+    /// The read end is closed right after spawn (writes raise SIGPIPE).
+    Closed,
+}
+
+/// Bytes per read of a [`StdoutMode::Slow`] reader.
+const SLOW_CHUNK: usize = 4096;
+/// A slow reader pauses after this many reads.
+const SLOW_READS_PER_PAUSE: usize = 16;
+const SLOW_PAUSE: Duration = Duration::from_millis(1);
+
+fn spawn_slow_reader<R: Read + Send + 'static>(mut r: R) -> JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let mut chunk = vec![0u8; SLOW_CHUNK];
+        for i in 1.. {
+            let n = r.read(&mut chunk).expect("read child output");
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&chunk[..n]);
+            if i % SLOW_READS_PER_PAUSE == 0 {
+                std::thread::sleep(SLOW_PAUSE);
+            }
+        }
+        out
+    })
+}
+
 /// Runs `bin` with `argv[0] = arg0`, `args`, and `POSIXLY_CORRECT` set iff `posix`.
 fn run(bin: &Path, arg0: &str, args: &[Vec<u8>], posix: bool) -> Outcome {
+    run_io(bin, arg0, args, posix, Stdio::null(), StdoutMode::Normal)
+}
+
+/// [`run`] with the given stdin and stdout handling.
+fn run_io(
+    bin: &Path,
+    arg0: &str,
+    args: &[Vec<u8>],
+    posix: bool,
+    stdin: Stdio,
+    stdout: StdoutMode,
+) -> Outcome {
     let mut cmd = Command::new(bin);
     cmd.arg0(arg0)
         .args(args.iter().map(|a| OsString::from_vec(a.clone())))
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env_remove("POSIXLY_CORRECT");
@@ -142,7 +190,15 @@ fn run(bin: &Path, arg0: &str, args: &[Vec<u8>], posix: bool) -> Outcome {
     let mut child = cmd
         .spawn()
         .unwrap_or_else(|e| panic!("spawn {}: {e}", bin.display()));
-    let out = spawn_reader(child.stdout.take().expect("stdout pipe"));
+    let child_out = child.stdout.take().expect("stdout pipe");
+    let out = match stdout {
+        StdoutMode::Normal => spawn_reader(child_out),
+        StdoutMode::Slow => spawn_slow_reader(child_out),
+        StdoutMode::Closed => {
+            drop(child_out);
+            std::thread::spawn(Vec::new)
+        }
+    };
     let err = spawn_reader(child.stderr.take().expect("stderr pipe"));
     let deadline = Instant::now() + RUN_TIMEOUT;
     let status = loop {
@@ -513,12 +569,13 @@ fn port_forward_odd_count_rust_only() {
     }
 }
 
-/// Paths outside this slice (C would connect to the device port) are
-/// checked against rovacom only.
+/// Paths outside the implemented slices (C would connect to the device
+/// port) are checked against rovacom only.
 #[test]
 fn not_implemented_rust_only() {
     for (extra, what) in [
-        (&["run", "file:///bin/true"][..], "remote command execution"),
+        (&["-t", "run", "file:///bin/true"][..], "terminal mode"),
+        (&["-s", "run", "file:///bin/true"][..], "signal forwarding"),
         (&["-c", "list"][..], "control command"),
         (&["-P"][..], "port forwarding"),
     ] {
@@ -594,4 +651,745 @@ fn alias_invocation() {
     check_alias(&[], &["--addr"]);
     let o = check_alias(&[BASIC], &["-l", "-p", "{P}"]);
     assert_eq!(o.stdout, BASIC);
+}
+
+// ---------------------------------------------------------------------------
+// Remote command sessions (`novacom [opts] <command...>`, no -t/-s).
+// ---------------------------------------------------------------------------
+
+const MAGIC: u32 = 0xDECA_FBAD;
+const T_DATA: u32 = 0;
+const T_ERR: u32 = 1;
+const T_OOB: u32 = 2;
+const OOB_EOF: u32 = 0;
+const OOB_SIGNAL: u32 = 1;
+const OOB_RETURN: u32 = 2;
+const OOB_RESIZE: u32 = 3;
+/// Header + meaningful OOB bytes (message + first union word).
+const OOB_MEANINGFUL: usize = 8;
+/// Read timeout of the mock device connection (guards against hangs).
+const MOCK_IO_TIMEOUT: Duration = Duration::from_secs(30);
+/// Largest DATA payload the mock echoes per packet.
+const ECHO_CHUNK: usize = 65536;
+
+/// A raw packet header (independent of the code under test).
+fn hdr(magic: u32, version: u32, size: u32, kind: u32) -> Vec<u8> {
+    [magic, version, size, kind]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect()
+}
+
+fn pkt(kind: u32, body: &[u8]) -> Vec<u8> {
+    let mut p = hdr(MAGIC, 1, u32::try_from(body.len()).expect("size"), kind);
+    p.extend_from_slice(body);
+    p
+}
+
+fn oob_body(message: u32, arg: u32) -> Vec<u8> {
+    let mut b = vec![0u8; 20];
+    b[..4].copy_from_slice(&message.to_le_bytes());
+    b[4..8].copy_from_slice(&arg.to_le_bytes());
+    b
+}
+
+fn oob(message: u32, arg: u32) -> Vec<u8> {
+    pkt(T_OOB, &oob_body(message, arg))
+}
+
+fn ret(rc: i32) -> Vec<u8> {
+    oob(OOB_RETURN, u32::from_le_bytes(rc.to_le_bytes()))
+}
+
+fn cat(parts: &[&[u8]]) -> Vec<u8> {
+    parts.concat()
+}
+
+/// One step of the mock device's script, run after it has read the command
+/// line. The mock always closes the connection after the last step.
+#[derive(Clone, Debug)]
+enum Step {
+    Send(Vec<u8>),
+    /// Sends each part as its own TCP segment, pausing between parts.
+    SendParts(Vec<Vec<u8>>, Duration),
+    /// Records client packets until an OOB EOF (or close) arrives.
+    ReadUntilEof,
+    /// Sends back all DATA payload received so far as DATA packets.
+    EchoStdin,
+    /// Records client bytes until the client closes the connection.
+    WaitClose,
+}
+
+/// What the client sent to the mock device port.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Recorded {
+    connections: usize,
+    command: Vec<u8>,
+    sent: Vec<u8>,
+}
+
+/// Splits recorded client packets into (meaningful bytes, OOB padding).
+/// OOB padding is uninitialized memory in C (bug B5) and is compared only
+/// for rovacom, which must send zeros.
+fn split_padding(sent: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let (mut meaningful, mut padding) = (Vec::new(), Vec::new());
+    let mut rest = sent;
+    while rest.len() >= 16 {
+        let size = u32::from_le_bytes(rest[8..12].try_into().expect("4 bytes")) as usize;
+        let kind = u32::from_le_bytes(rest[12..16].try_into().expect("4 bytes"));
+        let end = (16 + size).min(rest.len());
+        if kind == T_OOB && end >= 16 + OOB_MEANINGFUL {
+            meaningful.extend_from_slice(&rest[..16 + OOB_MEANINGFUL]);
+            padding.extend_from_slice(&rest[16 + OOB_MEANINGFUL..end]);
+        } else {
+            meaningful.extend_from_slice(&rest[..end]);
+        }
+        rest = &rest[end..];
+    }
+    meaningful.extend_from_slice(rest);
+    (meaningful, padding)
+}
+
+/// DATA payload of recorded client packets, concatenated.
+fn data_payload(sent: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut rest = sent;
+    while rest.len() >= 16 {
+        let size = u32::from_le_bytes(rest[8..12].try_into().expect("4 bytes")) as usize;
+        let kind = u32::from_le_bytes(rest[12..16].try_into().expect("4 bytes"));
+        let end = (16 + size).min(rest.len());
+        if kind == T_DATA {
+            out.extend_from_slice(&rest[16..end]);
+        }
+        rest = &rest[end..];
+    }
+    out
+}
+
+/// Reads one client packet and appends it to `rec.sent`. Returns false on
+/// close/error or after an OOB EOF.
+fn read_client_packet(s: &mut TcpStream, rec: &Mutex<Recorded>) -> bool {
+    let mut h = [0u8; 16];
+    if s.read_exact(&mut h).is_err() {
+        return false;
+    }
+    let size = u32::from_le_bytes(h[8..12].try_into().expect("4 bytes")) as usize;
+    let kind = u32::from_le_bytes(h[12..16].try_into().expect("4 bytes"));
+    let mut body = vec![0u8; size];
+    let ok = s.read_exact(&mut body).is_ok();
+    let mut r = rec.lock().expect("record lock");
+    r.sent.extend_from_slice(&h);
+    r.sent.extend_from_slice(&body);
+    let eof = kind == T_OOB && size >= 4 && body[..4] == OOB_EOF.to_le_bytes();
+    ok && !eof
+}
+
+fn serve_device(mut s: TcpStream, script: &[Step], rec: &Mutex<Recorded>) {
+    s.set_nonblocking(false).expect("blocking stream");
+    s.set_nodelay(true).expect("nodelay");
+    s.set_read_timeout(Some(MOCK_IO_TIMEOUT)).expect("timeout");
+    // The command line, one byte at a time (the client sends nothing else
+    // before it has read the response).
+    let mut byte = [0u8; 1];
+    while let Ok(1) = s.read(&mut byte) {
+        rec.lock().expect("record lock").command.push(byte[0]);
+        if byte[0] == b'\n' {
+            break;
+        }
+    }
+    // Send errors are ignored: the client may already have exited.
+    for step in script {
+        match step {
+            Step::Send(bytes) => {
+                let _ = s.write_all(bytes);
+            }
+            Step::SendParts(parts, pause) => {
+                for (i, part) in parts.iter().enumerate() {
+                    if i > 0 {
+                        std::thread::sleep(*pause);
+                    }
+                    let _ = s.write_all(part);
+                }
+            }
+            Step::ReadUntilEof => while read_client_packet(&mut s, rec) {},
+            Step::EchoStdin => {
+                let data = data_payload(&rec.lock().expect("record lock").sent);
+                for chunk in data.chunks(ECHO_CHUNK) {
+                    let _ = s.write_all(&pkt(T_DATA, chunk));
+                }
+            }
+            Step::WaitClose => {
+                let mut rest = Vec::new();
+                let _ = s.read_to_end(&mut rest);
+                rec.lock().expect("record lock").sent.extend(rest);
+            }
+        }
+    }
+}
+
+/// Mock device port: serves every connection with `script`.
+struct DeviceMock {
+    port: u16,
+    rec: Arc<Mutex<Recorded>>,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl DeviceMock {
+    fn start(script: Vec<Step>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind device mock");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let port = listener.local_addr().expect("address").port();
+        let rec = Arc::new(Mutex::new(Recorded::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (rec2, stop2) = (Arc::clone(&rec), Arc::clone(&stop));
+        let handle = std::thread::spawn(move || {
+            while !stop2.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((s, _)) => {
+                        rec2.lock().expect("record lock").connections += 1;
+                        serve_device(s, &script, &rec2);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(POLL)
+                    }
+                    Err(e) => panic!("device mock accept: {e}"),
+                }
+            }
+        });
+        Self {
+            port,
+            rec,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    /// Stops the mock and returns what it recorded.
+    fn finish(mut self) -> Recorded {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            h.join().expect("device mock thread");
+        }
+        self.rec.lock().expect("record lock").clone()
+    }
+}
+
+impl Drop for DeviceMock {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+static STDIN_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+/// A temporary regular file used as stdin. A regular file makes `read`
+/// return full 4096-byte chunks, so the client's DATA packet framing is
+/// deterministic.
+struct StdinFile(PathBuf);
+
+impl StdinFile {
+    fn new(data: &[u8]) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "rovacom-stdin-{}-{}",
+            std::process::id(),
+            STDIN_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, data).expect("write stdin file");
+        Self(path)
+    }
+
+    fn open(&self) -> Stdio {
+        Stdio::from(File::open(&self.0).expect("open stdin file"))
+    }
+}
+
+impl Drop for StdinFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// One session test case.
+struct Session<'a> {
+    /// Device list; `{D}` is the device mock port, `{R}` a refused port.
+    devlist: &'a str,
+    /// Arguments; `{P}` is the device-list port.
+    args: Vec<Vec<u8>>,
+    stdin: &'a [u8],
+    stdout: StdoutMode,
+    script: Vec<Step>,
+}
+
+impl<'a> Session<'a> {
+    fn new(cmd: &[&str], script: Vec<Step>) -> Self {
+        let mut args = vec![b"-p".to_vec(), b"{P}".to_vec()];
+        args.extend(cmd.iter().map(|c| c.as_bytes().to_vec()));
+        Self {
+            devlist: "{D} 0123456789abcdef0123456789abcdef01234567 usb castle-linux\n",
+            args,
+            stdin: b"",
+            stdout: StdoutMode::Normal,
+            script,
+        }
+    }
+
+    fn stdin(mut self, data: &'a [u8]) -> Self {
+        self.stdin = data;
+        self
+    }
+
+    fn stdout(mut self, mode: StdoutMode) -> Self {
+        self.stdout = mode;
+        self
+    }
+
+    fn devlist(mut self, devlist: &'a str) -> Self {
+        self.devlist = devlist;
+        self
+    }
+
+    /// Runs `bin` against fresh mocks.
+    fn run(&self, bin: &Path, stdin: &StdinFile) -> (Outcome, Recorded) {
+        let device = DeviceMock::start(self.script.clone());
+        let list = self
+            .devlist
+            .replace("{D}", &device.port.to_string())
+            .replace("{R}", &refused_port().to_string());
+        let mock = Mock::start(&[list.as_bytes()]);
+        let args: Vec<Vec<u8>> = self
+            .args
+            .iter()
+            .map(|a| {
+                if a == b"{P}" {
+                    mock.port.to_string().into_bytes()
+                } else {
+                    a.clone()
+                }
+            })
+            .collect();
+        let o = run_io(bin, "rovacom", &args, false, stdin.open(), self.stdout);
+        drop(mock);
+        (o, device.finish())
+    }
+
+    /// Runs rovacom only and checks its OOB padding is zero.
+    fn run_rust(&self) -> (Outcome, Recorded) {
+        let stdin = StdinFile::new(self.stdin);
+        let (o, rec) = self.run(&rovacom(), &stdin);
+        let (_, padding) = split_padding(&rec.sent);
+        assert!(padding.iter().all(|&b| b == 0), "B5: OOB padding not zero");
+        (o, rec)
+    }
+
+    /// Runs both binaries and asserts identical exit status, stdout, stderr,
+    /// command line and client packets (OOB padding excluded, B5).
+    fn check(&self) -> (Outcome, Recorded) {
+        let stdin = StdinFile::new(self.stdin);
+        let (c, c_rec) = self.run(&reference(), &stdin);
+        let (r, r_rec) = self.run_rust();
+        let what = String::from_utf8_lossy(&self.args.join(&b' ')).into_owned();
+        assert_eq!(r, c, "outcome, args {what:?}");
+        assert_eq!(
+            r_rec.connections, c_rec.connections,
+            "connections, {what:?}"
+        );
+        assert!(
+            r_rec.command == c_rec.command,
+            "command line differs, {what:?}"
+        );
+        let (r_sent, _) = split_padding(&r_rec.sent);
+        let (c_sent, _) = split_padding(&c_rec.sent);
+        assert!(r_sent == c_sent, "client packets differ, {what:?}");
+        (r, r_rec)
+    }
+}
+
+/// Usual script prefix: reply `ok`, then wait for the client's stdin EOF,
+/// so the client sends nothing more and every later close is an orderly one.
+fn after_eof(steps: &[Step]) -> Vec<Step> {
+    let mut v = vec![Step::Send(b"ok\n".to_vec()), Step::ReadUntilEof];
+    v.extend_from_slice(steps);
+    v
+}
+
+fn send_after_eof(bytes: Vec<u8>) -> Vec<Step> {
+    after_eof(&[Step::Send(bytes)])
+}
+
+const EOF_MSG: &[u8] = b"novacom: unexpected EOF from server\n";
+const CLOSED_MSG: &[u8] = b"\nnovacomd socket was closed prematurely\n";
+
+#[test]
+fn session_echo_empty_stdin() {
+    let (o, rec) = Session::new(
+        &["run", "file:///bin/cat"],
+        after_eof(&[Step::EchoStdin, Step::Send(ret(0))]),
+    )
+    .check();
+    assert_eq!(o.status, "exit 0");
+    assert!(o.stdout.is_empty() && o.stderr.is_empty());
+    assert_eq!(rec.command, b"run file:///bin/cat\n");
+    assert_eq!(rec.sent.len(), 36);
+}
+
+#[test]
+fn session_binary_stdin_all_byte_values() {
+    let data: Vec<u8> = (0..40).flat_map(|_| 0..=255u8).collect();
+    let (o, rec) = Session::new(
+        &["run", "file:///bin/cat"],
+        after_eof(&[Step::EchoStdin, Step::Send(ret(0))]),
+    )
+    .stdin(&data)
+    .check();
+    assert_eq!((o.status.as_str(), &o.stdout), ("exit 0", &data));
+    assert_eq!(data_payload(&rec.sent), data);
+}
+
+#[test]
+fn session_upload_10mib() {
+    let data: Vec<u8> = (0..10 * 1024 * 1024u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let (o, rec) = Session::new(&["run", "x"], send_after_eof(ret(0)))
+        .stdin(&data)
+        .check();
+    assert_eq!(o.status, "exit 0");
+    assert!(data_payload(&rec.sent) == data, "uploaded payload differs");
+}
+
+#[test]
+fn session_download_10mib_slow_consumer() {
+    let total = 10 * 1024 * 1024usize;
+    let data: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+    let mut stream = Vec::new();
+    // Packet sizes vary, including some larger than the 64 KiB receive buffer.
+    for (i, chunk) in data.chunks(100_000).enumerate() {
+        if i % 2 == 0 {
+            stream.extend(pkt(T_DATA, chunk));
+        } else {
+            for part in chunk.chunks(4096) {
+                stream.extend(pkt(T_DATA, part));
+            }
+        }
+    }
+    stream.extend(ret(0));
+    let (o, _) = Session::new(&["run", "x"], send_after_eof(stream))
+        .stdout(StdoutMode::Slow)
+        .check();
+    assert_eq!(o.status, "exit 0");
+    assert!(o.stdout == data, "downloaded payload differs");
+}
+
+#[test]
+fn session_stdout_stderr_interleaved() {
+    let stream = cat(&[
+        &pkt(T_DATA, b"out1\n"),
+        &pkt(T_ERR, b"err1\n"),
+        &pkt(T_DATA, b"out2\0\xff\n"),
+        &pkt(T_ERR, b"err2\0\n"),
+        &pkt(T_DATA, b"out3"),
+        &ret(0),
+    ]);
+    let (o, _) = Session::new(&["run", "x"], send_after_eof(stream)).check();
+    assert_eq!(o.stdout, b"out1\nout2\0\xff\nout3");
+    assert_eq!(o.stderr, b"err1\nerr2\0\n");
+}
+
+#[test]
+fn session_return_codes() {
+    for (rc, status, msg) in [
+        (0, "exit 0", false),
+        (1, "exit 1", true),
+        (255, "exit 255", true),
+        (256, "exit 0", true),
+        (-1, "exit 255", true),
+    ] {
+        let (o, _) = Session::new(&["run", "x"], send_after_eof(ret(rc))).check();
+        assert_eq!(o.status, status, "rc {rc}");
+        assert_eq!(o.stderr, if msg { EOF_MSG } else { b"" }, "rc {rc}");
+    }
+}
+
+#[test]
+fn session_peer_closes_early() {
+    let data = pkt(T_DATA, b"partial");
+    for (bytes, stdout) in [
+        // No RETURN.
+        (data.clone(), &b"partial"[..]),
+        // Mid-header.
+        (data[..7].to_vec(), b""),
+        // Mid-body (header and part of the body in one segment).
+        (data[..19].to_vec(), b"par"),
+    ] {
+        let (o, _) = Session::new(&["run", "x"], send_after_eof(bytes)).check();
+        assert_eq!(o.status, "exit 255");
+        assert_eq!(o.stdout, stdout);
+        assert_eq!(o.stderr, cat(&[CLOSED_MSG, EOF_MSG]));
+    }
+}
+
+#[test]
+fn session_bad_header() {
+    for (bytes, msg) in [
+        (hdr(0xDECA_FBAE, 1, 0, 0), &b"Bad packet header magic\n"[..]),
+        (hdr(MAGIC, 2, 0, 0), b"Unsupported packet version\n"),
+    ] {
+        let (o, _) = Session::new(&["run", "x"], send_after_eof(bytes)).check();
+        assert_eq!(o.status, "exit 255");
+        assert_eq!(
+            o.stderr,
+            cat(&[msg, b"\nbad data from other end\n", EOF_MSG])
+        );
+    }
+}
+
+#[test]
+fn session_unknown_type_and_zero_size() {
+    let stream = cat(&[&pkt(7, b"abc"), &pkt(T_DATA, b"ok"), &ret(0)]);
+    let (o, _) = Session::new(&["run", "x"], send_after_eof(stream)).check();
+    assert_eq!(o.status, "exit 0");
+    assert_eq!(o.stderr, b"unknown packet, discarding data\n");
+    // Zero-size DATA and ERR are taken as a closed socket (quirk B3, kept).
+    for kind in [T_DATA, T_ERR] {
+        let stream = cat(&[&pkt(kind, b""), &ret(0)]);
+        let (o, _) = Session::new(&["run", "x"], send_after_eof(stream)).check();
+        assert_eq!(o.status, "exit 255");
+        assert_eq!(o.stderr, cat(&[CLOSED_MSG, EOF_MSG]));
+    }
+}
+
+#[test]
+fn session_oob_sizes() {
+    // Size 0: diagnostic, then a closed socket (B3).
+    let (o, _) = Session::new(
+        &["run", "x"],
+        send_after_eof(cat(&[&pkt(T_OOB, b""), &ret(0)])),
+    )
+    .check();
+    assert_eq!(o.status, "exit 255");
+    // Size 8: silently consumed.
+    let short = pkt(T_OOB, &oob_body(OOB_RETURN, 5)[..8]);
+    let (o, _) = Session::new(&["run", "x"], send_after_eof(cat(&[&short, &ret(3)]))).check();
+    assert_eq!(
+        (o.status.as_str(), o.stderr.as_slice()),
+        ("exit 3", EOF_MSG)
+    );
+    // Size 24: the message is acted on, then the 4 stray bytes are discarded.
+    let mut body = oob_body(OOB_EOF, 2);
+    body.extend_from_slice(b"WXYZ");
+    let stream = cat(&[&pkt(T_OOB, &body), &pkt(T_DATA, b"after"), &ret(0)]);
+    let (o, _) = Session::new(&["run", "x"], send_after_eof(stream)).check();
+    assert_eq!(o.stdout, b"after");
+    assert_eq!(
+        o.stderr,
+        b"oversized oob message. sizeof(m) = 20, h.size = 24, current pos = 20\n"
+    );
+}
+
+#[test]
+fn session_peer_oob_messages() {
+    let stream = cat(&[
+        &oob(9, 0),
+        &oob(u32::MAX, 0),
+        &oob(OOB_SIGNAL, 2),
+        &oob(OOB_SIGNAL, 0x8000_0000),
+        &oob(OOB_RESIZE, 24),
+        &oob(OOB_EOF, 2),
+        &oob(OOB_EOF, 0),
+        &pkt(T_ERR, b"still here\n"),
+        &ret(0),
+    ]);
+    let (o, _) = Session::new(&["run", "x"], send_after_eof(stream)).check();
+    assert_eq!(o.status, "exit 0");
+    assert!(
+        o.stderr
+            .starts_with(b"unknown OOB message: 9\nunknown OOB message: -1\n")
+    );
+}
+
+#[test]
+fn session_stdout_closed_by_peer() {
+    let stream = cat(&[
+        &pkt(T_DATA, b"before"),
+        &oob(OOB_EOF, 1),
+        &pkt(T_DATA, b"after"),
+        &pkt(T_ERR, b"err\n"),
+        &ret(0),
+    ]);
+    let (o, _) = Session::new(&["run", "x"], send_after_eof(stream)).check();
+    assert_eq!(o.status, "exit 0");
+    assert_eq!(o.stdout, b"before");
+    assert_eq!(
+        o.stderr,
+        b"\nReceived data for stdout after closing stdout\nerr\n"
+    );
+}
+
+#[test]
+fn session_responses() {
+    let long = "x".repeat(3000);
+    for (resp, err) in [
+        ("req:auth\n", "password required\n".to_string()),
+        ("req:authorize me\n", "password required\n".to_string()),
+        (
+            "unrecognized command run\n",
+            "unknown command\n".to_string(),
+        ),
+        (
+            "o\n",
+            "bad or error response from other side: 'o'\n".to_string(),
+        ),
+        (
+            "\n",
+            "bad or error response from other side: ''\n".to_string(),
+        ),
+        (
+            "",
+            "bad or error response from other side: ''\n".to_string(),
+        ),
+        (
+            "bad\0rest\n",
+            "bad or error response from other side: 'bad'\n".to_string(),
+        ),
+        (
+            &format!("{long}\n"),
+            format!(
+                "bad or error response from other side: '{}'\n",
+                &long[..2047]
+            ),
+        ),
+    ] {
+        // With no reply at all the mock just closes (EOF reads as "").
+        let script = if resp.is_empty() {
+            Vec::new()
+        } else {
+            vec![Step::Send(resp.as_bytes().to_vec()), Step::WaitClose]
+        };
+        let (o, rec) = Session::new(&["run", "x"], script)
+            .stdin(b"never read")
+            .check();
+        assert_eq!(o.status, "exit 1", "{resp:?}");
+        assert_eq!(o.stderr, err.as_bytes(), "{resp:?}");
+        assert!(rec.sent.is_empty(), "{resp:?}");
+    }
+    // "ok" with trailing NUL garbage is accepted.
+    let script = vec![
+        Step::Send(b"ok\0junk\n".to_vec()),
+        Step::ReadUntilEof,
+        Step::Send(ret(0)),
+    ];
+    let (o, _) = Session::new(&["run", "x"], script).check();
+    assert_eq!(o.status, "exit 0");
+    // An over-long "ok" line: the rest of it is decoded as a packet header.
+    let script = vec![
+        Step::Send(format!("ok{}\n", "y".repeat(2100)).into_bytes()),
+        Step::WaitClose,
+    ];
+    let (o, rec) = Session::new(&["run", "x"], script).check();
+    assert_eq!(o.status, "exit 255");
+    assert_eq!(
+        o.stderr,
+        cat(&[
+            b"Bad packet header magic\n\nbad data from other end\n",
+            EOF_MSG
+        ])
+    );
+    assert!(rec.sent.is_empty());
+}
+
+#[test]
+fn session_many_operands() {
+    let ops: Vec<String> = (0..300).map(|i| format!("arg{i}")).collect();
+    let mut cmd: Vec<&str> = vec!["run", "file:///bin/echo"];
+    cmd.extend(ops.iter().map(String::as_str));
+    cmd.push("");
+    cmd.push("a b");
+    let (_, rec) = Session::new(&cmd, send_after_eof(ret(0))).check();
+    let expected = format!("{}\n", cmd.join(" "));
+    assert!(expected.len() < 4096);
+    assert_eq!(rec.command, expected.as_bytes());
+}
+
+/// A command line longer than 4095 bytes overflows the C `command` buffer
+/// (bug B1, undefined behavior), so only rovacom is checked: it sends the
+/// whole line.
+#[test]
+fn session_long_command_rust_only() {
+    let big = "z".repeat(5000);
+    let (o, rec) = Session::new(&["run", &big], send_after_eof(ret(0))).run_rust();
+    assert_eq!(o.status, "exit 0");
+    assert_eq!(rec.command, format!("run {big}\n").as_bytes());
+}
+
+#[test]
+fn session_device_selection_and_refused() {
+    let two = "{R} n1 usb castle\n{D} n2 tcp topaz\n";
+    let (o, rec) = Session::new(&["-d", "TOPAZ", "run", "x"], send_after_eof(ret(0)))
+        .devlist(two)
+        .check();
+    assert_eq!((o.status.as_str(), rec.connections), ("exit 0", 1));
+    let (o, rec) = Session::new(&["run", "x"], send_after_eof(ret(0)))
+        .devlist(two)
+        .check();
+    assert_eq!(o.stderr, b"failed to connect to server\n");
+    assert_eq!((o.status.as_str(), rec.connections), ("exit 1", 0));
+}
+
+#[test]
+fn closed_stdout_pipe_raises_sigpipe() {
+    let stream = cat(&[&pkt(T_DATA, b"hello\n"), &ret(0)]);
+    let (o, _) = Session::new(
+        &["run", "x"],
+        after_eof(&[Step::Send(stream), Step::WaitClose]),
+    )
+    .stdout(StdoutMode::Closed)
+    .check();
+    assert_eq!(o.status, "signal 13");
+    // Device listing to a closed pipe (a slice-1 path).
+    let mock = Mock::start(&[BASIC]);
+    let args = argv(&["-l", "-p", "{P}"], mock.port);
+    let c = run_io(
+        &reference(),
+        "rovacom",
+        &args,
+        false,
+        Stdio::null(),
+        StdoutMode::Closed,
+    );
+    let r = run_io(
+        &rovacom(),
+        "rovacom",
+        &args,
+        false,
+        Stdio::null(),
+        StdoutMode::Closed,
+    );
+    assert_eq!(r, c);
+    assert_eq!(r.status, "signal 13");
+}
+
+/// Header and body in separate TCP segments with a pause between them. C
+/// reads the body in the same call as the header and takes EAGAIN as a
+/// closed socket (bug B2), so its result depends on timing; only rovacom
+/// is checked.
+#[test]
+fn session_split_segments_rust_only() {
+    let data = pkt(T_DATA, b"body bytes");
+    let o_ret = ret(4);
+    let parts = vec![
+        data[..16].to_vec(),
+        data[16..].to_vec(),
+        o_ret[..10].to_vec(),
+        o_ret[10..16].to_vec(),
+        o_ret[16..].to_vec(),
+    ];
+    let script = after_eof(&[Step::SendParts(parts, Duration::from_millis(50))]);
+    let (o, _) = Session::new(&["run", "x"], script).run_rust();
+    assert_eq!(o.status, "exit 4");
+    assert_eq!(o.stdout, b"body bytes");
+    assert_eq!(o.stderr, EOF_MSG);
 }
