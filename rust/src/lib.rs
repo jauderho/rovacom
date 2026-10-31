@@ -8,6 +8,7 @@ pub mod control;
 pub mod devlist;
 pub mod net;
 pub mod packet;
+pub mod relay;
 pub mod session;
 pub mod stdio;
 #[allow(unsafe_code)]

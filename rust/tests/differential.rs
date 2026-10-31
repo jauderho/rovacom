@@ -8,6 +8,8 @@
 
 #[path = "differential/control.rs"]
 mod control;
+#[path = "differential/relay.rs"]
+mod relay;
 #[path = "differential/terminal.rs"]
 mod terminal;
 
@@ -308,7 +310,7 @@ fn check(responses: &[&[u8]], parts: &[&str]) -> Outcome {
 }
 
 const BASIC: &[u8] = b"6970 0123456789abcdef0123456789abcdef01234567 usb castle-linux\n\
-6971 FEDCBA9876543210FEDCBA9876543210FEDCBA98 tcp Topaz-Linux sess123456789\n";
+6972 FEDCBA9876543210FEDCBA9876543210FEDCBA98 tcp Topaz-Linux sess123456789\n";
 
 fn usage_status() -> String {
     "exit 1".to_string()
@@ -593,25 +595,6 @@ fn port_forward_odd_count_rust_only() {
         assert_eq!(o.stderr, b"Port Forwarding params were not correct\n");
         assert_eq!(o.stdout, rovacom::cli::usage_text(b"rovacom"));
     }
-}
-
-/// Port forwarding is not implemented yet (C would start the relay), so it
-/// is checked against rovacom only.
-#[test]
-fn not_implemented_rust_only() {
-    let mock = Mock::start(&[BASIC]);
-    let o = run(
-        &rovacom(),
-        "rovacom",
-        &argv(&["-p", "{P}", "-P"], mock.port),
-        false,
-    );
-    assert_eq!(o.status, "exit 70");
-    assert!(o.stdout.is_empty());
-    assert_eq!(
-        o.stderr,
-        b"rovacom: port forwarding is not implemented in this build\n"
-    );
 }
 
 static ALIAS_DIR_SEQ: AtomicUsize = AtomicUsize::new(0);

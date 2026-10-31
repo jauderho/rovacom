@@ -9,15 +9,13 @@ use crate::console::{self, Mode};
 use crate::control;
 use crate::devlist::{self, FoundDevice};
 use crate::net;
+use crate::relay;
 use crate::session;
 use crate::stdio::StdioOut;
 use crate::sys::{self, FdReader, FdWriter, STDERR_FD, STDIN_FD, STDOUT_FD, SignalPipe};
 
 /// Delay between `-w` retries (C `usleep(500000)`).
 const WAIT_RETRY_DELAY: Duration = Duration::from_millis(500);
-
-/// Exit code for paths this build does not implement yet (`EX_SOFTWARE`).
-pub const NOT_IMPLEMENTED_EXIT: u8 = 70;
 
 /// Entry point for the binary: reads the process environment and runs.
 pub fn main_entry() -> u8 {
@@ -102,8 +100,9 @@ fn run_parsed(opts: Options, argv0: &[u8], out: &mut dyn Write, err: &mut dyn Wr
     after_device_found(opts, &device, argv0, out, err)
 }
 
-/// Everything after a device is found. Port forwarding is the only path
-/// not implemented yet.
+/// Everything after a device is found. With `-P` the relay runs on the
+/// process stdout and stderr and never returns (`out` holds nothing yet; it
+/// is flushed anyway).
 fn after_device_found(
     mut opts: Options,
     device: &FoundDevice,
@@ -112,14 +111,8 @@ fn after_device_found(
     err: &mut dyn Write,
 ) -> u8 {
     if opts.port_forward {
-        let _ = err.write_all(
-            &[
-                argv0,
-                b": port forwarding is not implemented in this build\n",
-            ]
-            .concat(),
-        );
-        NOT_IMPLEMENTED_EXIT
+        let _ = out.flush();
+        relay::run(&opts.forwards, &opts.server_host, device.port)
     } else if opts.cmd.is_none() && opts.operands.is_empty() {
         let _ = out.write_all(&cli::usage_text(argv0));
         1
@@ -289,24 +282,8 @@ mod tests {
 
     /// `-c` cases connect to port 6971 and are tested only in
     /// `tests/differential.rs`, which first binds that port itself. `-t` and
-    /// `-s` would change the test process's console and signal handlers;
-    /// they are tested there too, in child processes.
-    #[test]
-    fn not_implemented_paths() {
-        for extra in [&["-P"][..], &["-ts", "-P", "run"]] {
-            let port = serve(ONE, 1).to_string();
-            let mut args = vec!["-a", "127.0.0.1", "-p", &port];
-            args.extend_from_slice(extra);
-            let (code, out, err) = run_args(&args);
-            assert_eq!(code, NOT_IMPLEMENTED_EXIT);
-            assert!(out.is_empty());
-            assert_eq!(
-                err,
-                b"prog: port forwarding is not implemented in this build\n"
-            );
-        }
-    }
-
+    /// `-s` would change the test process's console and signal handlers, and
+    /// `-P` never returns; they are tested there too, in child processes.
     #[test]
     fn usage_when_no_command() {
         let port = serve(ONE, 1).to_string();

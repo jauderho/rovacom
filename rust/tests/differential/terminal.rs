@@ -25,13 +25,13 @@ const SECOND_SIZE: (u16, u16) = (50, 132);
 const TYPED: &[u8] = b"typed \x03 \x1c \x1a \x7f\x08 x\n";
 
 /// Device port driven by the test: one connection, read step by step.
-struct LiveDevice {
+pub(super) struct LiveDevice {
     listener: TcpListener,
     port: u16,
 }
 
 impl LiveDevice {
-    fn bind() -> Self {
+    pub(super) fn bind() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind device mock");
         listener.set_nonblocking(true).expect("nonblocking");
         let port = listener.local_addr().expect("address").port();
@@ -39,7 +39,7 @@ impl LiveDevice {
     }
 
     /// Device-list server whose only device is this port.
-    fn devlist(&self) -> Mock {
+    pub(super) fn devlist(&self) -> Mock {
         let line = format!(
             "{} 0123456789abcdef0123456789abcdef01234567 usb castle\n",
             self.port
@@ -48,7 +48,7 @@ impl LiveDevice {
     }
 
     /// Accepts the client and reads its command line.
-    fn accept(&self) -> Conn {
+    pub(super) fn accept(&self) -> Conn {
         let deadline = Instant::now() + IO_TIMEOUT;
         let s = loop {
             let accepted = {
@@ -95,22 +95,22 @@ fn signal(signo: libc::c_int) -> Oob {
 
 /// A client packet: OOB message or DATA payload.
 #[derive(Debug, PartialEq, Eq)]
-enum Packet {
+pub(super) enum Packet {
     Oob(Oob),
     Data(Vec<u8>),
 }
 
-struct Conn {
-    s: TcpStream,
-    command: Vec<u8>,
+pub(super) struct Conn {
+    pub(super) s: TcpStream,
+    pub(super) command: Vec<u8>,
 }
 
 impl Conn {
-    fn send(&mut self, bytes: &[u8]) {
+    pub(super) fn send(&mut self, bytes: &[u8]) {
         self.s.write_all(bytes).expect("send to client");
     }
 
-    fn packet(&mut self) -> Packet {
+    pub(super) fn packet(&mut self) -> Packet {
         let mut h = [0u8; 16];
         self.s.read_exact(&mut h).expect("client packet header");
         let word = |i: usize| u32::from_le_bytes(h[i..i + 4].try_into().expect("4 bytes"));
@@ -153,7 +153,7 @@ impl Conn {
 }
 
 /// A pty pair whose master output is collected by a thread.
-struct Pty {
+pub(super) struct Pty {
     master: File,
     slave: File,
     seen: Arc<Mutex<Vec<u8>>>,
@@ -161,7 +161,7 @@ struct Pty {
 }
 
 impl Pty {
-    fn open() -> Self {
+    pub(super) fn open() -> Self {
         let (master, slave) = openpty();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let reader = {
@@ -183,7 +183,7 @@ impl Pty {
         }
     }
 
-    fn slave(&self) -> Stdio {
+    pub(super) fn slave(&self) -> Stdio {
         Stdio::from(self.slave.try_clone().expect("clone slave"))
     }
 
@@ -213,8 +213,13 @@ impl Pty {
         self.master.write_all(bytes).expect("write to pty master");
     }
 
+    /// Everything read from the master so far.
+    pub(super) fn output(&self) -> Vec<u8> {
+        self.seen.lock().expect("pty lock").clone()
+    }
+
     /// Closes the slave and returns everything read from the master.
-    fn finish(self) -> Vec<u8> {
+    pub(super) fn finish(self) -> Vec<u8> {
         drop(self.slave);
         self.reader.join().expect("pty reader");
         self.seen.lock().expect("pty lock").clone()
@@ -222,8 +227,8 @@ impl Pty {
 }
 
 /// A spawned client with its stdout (if piped) and stderr collected.
-struct Client {
-    child: Child,
+pub(super) struct Client {
+    pub(super) child: Child,
     stdout: Option<JoinHandle<Vec<u8>>>,
     stderr: JoinHandle<Vec<u8>>,
     what: String,
@@ -232,7 +237,7 @@ struct Client {
 impl Client {
     /// Spawns `bin`; stdout is piped if `stdout` is `None`. With `ctty`, the
     /// child starts a new session with its stdin as controlling terminal.
-    fn spawn(
+    pub(super) fn spawn(
         bin: &Path,
         args: &[Vec<u8>],
         stdin: Stdio,
@@ -272,14 +277,14 @@ impl Client {
         }
     }
 
-    fn kill(&self, signo: libc::c_int) {
+    pub(super) fn kill(&self, signo: libc::c_int) {
         let pid = libc::pid_t::try_from(self.child.id()).expect("pid");
         // SAFETY: `kill` only sends a signal to our own child process.
         let rc = unsafe { libc::kill(pid, signo) };
         assert_eq!(rc, 0, "kill: {}", std::io::Error::last_os_error());
     }
 
-    fn assert_running(&mut self) {
+    pub(super) fn assert_running(&mut self) {
         assert!(
             self.child.try_wait().expect("try_wait").is_none(),
             "{} exited",
@@ -288,7 +293,7 @@ impl Client {
     }
 
     /// Waits for exit: (status, stdout, stderr).
-    fn finish(mut self) -> (String, Vec<u8>, Vec<u8>) {
+    pub(super) fn finish(mut self) -> (String, Vec<u8>, Vec<u8>) {
         let status = wait_child(&mut self.child, &self.what);
         let out = self
             .stdout
@@ -497,9 +502,18 @@ fn sig_run(bin: &Path) -> SigOutcome {
     }
 }
 
+/// Attempts for the C side of [`signals_forwarded`].
+const C_SIGNAL_ATTEMPTS: usize = 5;
+
+/// C forwards a signal only when it interrupts `select` (bug B4), so under
+/// load it sometimes drops one and its run times out (8 of 20 runs on a
+/// loaded 2-core Linux host; rovacom 0 of 20). The reference is retried;
+/// rovacom runs once and is checked strictly.
 #[test]
 fn signals_forwarded() {
-    let c = sig_run(&reference());
+    let c = (0..C_SIGNAL_ATTEMPTS)
+        .find_map(|_| std::panic::catch_unwind(|| sig_run(&reference())).ok())
+        .expect("C reference dropped a signal in every attempt (bug B4)");
     let r = sig_run(&rovacom());
     assert_eq!(r, c);
     assert_eq!(

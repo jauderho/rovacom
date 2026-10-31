@@ -1,7 +1,8 @@
 //! Unix system calls the C client makes directly: `select`, raw `read` /
 //! `write` / `close` on the standard fds, `send` without `MSG_NOSIGNAL`,
-//! the default `SIGPIPE` disposition, `isatty`, `tcgetattr` /
-//! `tcsetattr`, `TIOCGWINSZ`, and the signal self-pipe.
+//! `recv`, the `SIGPIPE` disposition, `isatty`, `tcgetattr` /
+//! `tcsetattr`, `TIOCGWINSZ`, the signal self-pipe, `errno` / `strerror`
+//! and the relay's listening socket.
 //!
 //! This is the only module with `unsafe` code.
 
@@ -63,6 +64,98 @@ pub fn send(sock: &TcpStream, buf: &[u8]) -> io::Result<usize> {
     // SAFETY: `sock` owns a valid fd; `buf` is valid for `buf.len()` bytes.
     let n = unsafe { libc::send(sock.as_raw_fd(), buf.as_ptr().cast(), buf.len(), 0) };
     check(n)
+}
+
+/// C `recv(fd, buf, len, 0)`: one call, no retry.
+pub fn recv(sock: &TcpStream, buf: &mut [u8]) -> io::Result<usize> {
+    // SAFETY: `sock` owns a valid fd; `buf` is valid for writes of
+    // `buf.len()` bytes.
+    let n = unsafe { libc::recv(sock.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
+    check(n)
+}
+
+/// C `signal(SIGPIPE, SIG_IGN)` (relay): a write to a closed socket fails
+/// with `EPIPE` instead of killing the process.
+pub fn ignore_sigpipe() {
+    // SAFETY: `signal` with `SIG_IGN` installs no handler code; it only
+    // changes the disposition of a valid signal number.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+}
+
+/// The calling thread's `errno`.
+pub fn errno() -> libc::c_int {
+    // SAFETY: `errno_location` returns the calling thread's errno slot,
+    // which is valid for the life of the thread.
+    unsafe { *errno_location() }
+}
+
+/// Sets the calling thread's `errno`.
+pub fn set_errno(value: libc::c_int) {
+    // SAFETY: as in `errno`.
+    unsafe { *errno_location() = value }
+}
+
+/// C `strerror(errnum)` text, from the thread-safe XSI `strerror_r` (glibc
+/// `__xpg_strerror_r`), which gives the same text. Unknown numbers give the
+/// libc "unknown error" text, which `strerror_r` writes even when it
+/// reports `EINVAL`.
+pub fn strerror(errnum: libc::c_int) -> Vec<u8> {
+    let mut buf = [0u8; 256];
+    // SAFETY: `buf` is valid for writes of `buf.len()` bytes; `strerror_r`
+    // writes a NUL-terminated string of at most that many bytes.
+    unsafe {
+        libc::strerror_r(errnum, buf.as_mut_ptr().cast(), buf.len());
+    }
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    buf[..len].to_vec()
+}
+
+/// C `create_listen_socket(port)` (`socket.c`): an `AF_INET` stream socket
+/// with `SO_REUSEADDR`, bound to `INADDR_ANY` on `port` truncated to 16 bits
+/// (C `htons`), listening with backlog `SOMAXCONN`. Like C, the socket is
+/// not close-on-exec. On failure the socket is closed and the error is the
+/// `errno` of the failed call.
+pub fn create_listen_socket(port: i32) -> io::Result<std::net::TcpListener> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    // SAFETY: `socket` takes plain integers and returns a new fd or -1.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a new socket that nothing else owns; `OwnedFd` closes
+    // it on every path below.
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    let reuse: libc::c_int = 1;
+    // SAFETY: `zeroed` is a valid `sockaddr_in` (all integer fields).
+    let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    addr.sin_family = libc::AF_INET as libc::sa_family_t;
+    addr.sin_port = (port as u16).to_be();
+    addr.sin_addr.s_addr = libc::INADDR_ANY.to_be();
+    // SAFETY: `fd` is a valid socket; the option and address pointers point
+    // at live values of the sizes passed.
+    let ok = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            (&raw const reuse).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        ) == 0
+            && libc::bind(
+                fd,
+                (&raw const addr).cast(),
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            ) == 0
+            && libc::listen(fd, libc::SOMAXCONN) == 0
+    };
+    if !ok {
+        // Read before `owned` is dropped: `close` succeeds and C reports
+        // the errno of the failed call.
+        return Err(io::Error::last_os_error());
+    }
+    Ok(std::net::TcpListener::from(owned))
 }
 
 /// C `read(fd, buf, len)`.
