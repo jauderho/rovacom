@@ -17,7 +17,7 @@ Status: `open` Â· `applied-in-port` (fixed as part of the port, see ASSESSMENT Â
 | I7 | Stability | macOS `-t` sets VINTR/VQUIT/VSUSP to `'\0'`, which is not `_POSIX_VDISABLE` (255) on macOS: Ctrl-@ interrupts locally | Use `_POSIX_VDISABLE` | None | open |
 | I8 | Stability | Death by signal (no `-s`) leaves tty raw: restore only via `atexit` | Restore termios in a guard + on fatal signals | None | open |
 | I9 | Stability | False "socket closed" on `EAGAIN` between header and body (B2) | Treat `EAGAIN` as no data | None | applied-in-port |
-| I10 | Stability | Signals silently dropped when `errno` is not stale `EINTR` (B4) | Reliable self-pipe | None | applied-in-port |
+| I10 | Stability | Signals silently dropped when `errno` is not stale `EINTR` (B4); the C handler also clobbers `errno` | Atomic mask + self-pipe; handler saves `errno` | None | applied-in-port |
 | I11 | Stability | Zero-length DATA/OOB packets are treated as disconnect (B3) | Accept zero-length packets | None (receiver only) | open |
 | I12 | Stability | Remote non-zero exit prints misleading `novacom: unexpected EOF from server` | Print only on real EOF | None (stderr text) | open |
 | I13 | Stability | `-c list` never reads the host list it requested (B12) | Print response body | None | open |
@@ -36,3 +36,4 @@ Status: `open` Â· `applied-in-port` (fixed as part of the port, see ASSESSMENT Â
 | I26 | Security | Password echo is disabled only if both stdin and stdout are terminals (`setconsole` gives up if `tcgetattr(1)` fails): `rovacom -c login \| tee log` echoes the password | Disable echo on stdin (or `/dev/tty`) independently | None | open |
 | I27 | Stability | B6 leaves the tty with only ECHO set (no ICANON/ISIG) between the prompt and exit; Ctrl-C does not work while waiting for the daemon | Restore the saved attributes instead of `&= ECHO` | None | open |
 | I28 | Security | SHA-1 auth hash computed over an unbounded `snprintf` buffer (B14) | Hash the full input | None | applied-in-port |
+| I29 | Maintenance | The port 6971 test lock is per process, so two overlapping `cargo test` runs on one machine make the control tests refuse to run (seen once) | Cross-process lock file (`flock`) for the control tests | None (tests only) | open |

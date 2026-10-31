@@ -1,6 +1,6 @@
 # rovacom: Compatibility Matrix and Verification Report
 
-Last updated: 2026-10-30. Slices 1 (device listing), 2 (remote command data stream, no tty) and 3 (`-c` control commands, password prompt) complete.
+Last updated: 2026-10-30. Slices 1 (device listing), 2 (remote command data stream), 3 (`-c` control commands, password prompt) and 4 (`-t` terminal mode, `-s` signal forwarding) complete.
 
 ## Validation runs
 
@@ -19,9 +19,9 @@ Commands (run in `rust/`): `cargo fmt --check`, `cargo check --all-targets --loc
 | Item | macOS | Linux |
 |---|---|---|
 | fmt / check / clippy `-D warnings` | executed, passed | executed, passed |
-| Unit tests | executed, 72 passed (2 full runs) | executed, 71 passed (2 full runs; 1 test is macOS-only) |
-| Differential tests vs C (mock novacomd, merged-stream and pty tests) | executed, 50 passed (2 full runs) | executed, 50 passed (2 full runs) |
-| Harness negative checks | slice 1: wrong reference fails 18 of 20; slices 2-3: 6 deliberate code mutations each caught; slice 3: tests refuse to run with a fake wildcard listener on 6971 | not executed |
+| Unit tests | executed, 75 passed (2 full runs) | executed, 74 passed (2 full runs; 1 test is macOS-only) |
+| Differential tests vs C (mock novacomd, merged-stream and pty tests) | executed, 55 passed (2 full runs) | executed, 55 passed (2 full runs) |
+| Harness negative checks | slice 1: wrong reference fails 18 of 20; slices 2-4: 9 deliberate code mutations each caught; slice 3: tests refuse to run with a fake wildcard listener on 6971 | not executed |
 | CI workflow (`.github/workflows/rust.yml`) | proposed, **never run** | proposed, **never run** |
 | Linux arm64, macOS x86_64 | not executed (CI jobs proposed) | not executed |
 | Real novacomd / rovacomd | blocked: none available | blocked: none available |
@@ -65,14 +65,19 @@ Commands (run in `rust/`): `cargo fmt --check`, `cargo check --all-targets --loc
 | `-w` session-id carry-over | preserved, verified | same |
 | Password > 4055 bytes | **intentionally changed** (B14): hashed in full; C UB | same |
 | `-r` password visible in `ps` after use | **differs** (I25): C scrubs argv; rovacom does not | same |
-| `-c` with `-t` or `-s` | unsupported in this build (exit 70) | same |
-| `-t` / `-s` terminal and signals | unsupported in this build (exit 70) | same |
+| `-t` terminal attributes while running and restored after exit | preserved, verified (PENDIN left set, as C) | preserved, verified |
+| `-t` typed control bytes (0x03, 0x1c, 0x1a, 0x7f) passed through as data | preserved, verified | same |
+| `-t` NUL key | preserved, verified: kills with SIGINT (P2) | preserved, verified: passed as data |
+| Initial RESIZE (pty size, or 0x0 when stdout is not a tty); RESIZE on SIGWINCH | preserved, verified | same |
+| `-s` forwards SIGINT, SIGHUP, SIGQUIT, SIGTERM; process survives | preserved, verified | same |
+| Signals arriving while blocked on a socket write | **intentionally changed** (B4): all forwarded once, lowest first, duplicates merged; C drops them | same |
+| `-c` with `-t` / `-s` | preserved, verified | same |
+| `failed to establish pipe ` path | implemented, unverified (needs fd exhaustion) | same |
 | `-P` port forwarding | unsupported in this build (exit 70) | same |
 
 ## Remaining work before full replacement
 
-1. Slice 4: termios `-t`, signal forwarding `-s`, SIGWINCH resize (extends `sys`).
-2. Slice 5: `-P` / `-f` port forwarding relay.
-3. Run CI on real runners; Linux arm64 and macOS x86_64 coverage.
-4. Interop with `rovacomd` and, with approval, read-only tests against the Pre3.
-5. Phase 5 build and deployment docs, including `novacom` alias setup without system-wide install.
+1. Slice 5: `-P` / `-f` port forwarding relay.
+2. Run CI on real runners; Linux arm64 and macOS x86_64 coverage.
+3. Interop with `rovacomd` and, with approval, read-only tests against the Pre3.
+4. Phase 5 build and deployment docs, including `novacom` alias setup without system-wide install.
