@@ -1,6 +1,7 @@
 //! Unix system calls the C client makes directly: `select`, raw `read` /
 //! `write` / `close` on the standard fds, `send` without `MSG_NOSIGNAL`,
-//! and the default `SIGPIPE` disposition.
+//! the default `SIGPIPE` disposition, `isatty`, and `tcgetattr` /
+//! `tcsetattr`.
 //!
 //! This is the only module with `unsafe` code.
 
@@ -101,6 +102,50 @@ impl io::Write for FdWriter {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+/// Unbuffered reader on a raw fd (C `read(2)`), used for fd 0.
+#[derive(Clone, Copy, Debug)]
+pub struct FdReader(pub RawFd);
+
+impl io::Read for FdReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        read(self.0, buf)
+    }
+}
+
+/// C `isatty(fd)`.
+pub fn isatty(fd: RawFd) -> bool {
+    // SAFETY: `isatty` only inspects the fd; an invalid fd returns 0.
+    unsafe { libc::isatty(fd) == 1 }
+}
+
+/// Terminal attributes (C `struct termios`).
+pub type Termios = libc::termios;
+
+/// An all-zero `struct termios`, like a zero-initialized C static.
+pub fn zeroed_termios() -> Termios {
+    // SAFETY: `termios` is a plain C struct of integers and integer arrays,
+    // for which all-zero bytes are a valid value.
+    unsafe { std::mem::zeroed() }
+}
+
+/// C `tcgetattr(fd, &t)`; `None` if the call fails.
+pub fn tcgetattr(fd: RawFd) -> Option<Termios> {
+    let mut t = zeroed_termios();
+    // SAFETY: `t` is a live, initialized `termios` the call may write to; an
+    // invalid fd or a non-terminal only makes the call fail.
+    let rc = unsafe { libc::tcgetattr(fd, &raw mut t) };
+    (rc == 0).then_some(t)
+}
+
+/// C `tcsetattr(fd, TCSANOW, t)`; the result is ignored, as in C.
+pub fn tcsetattr_now(fd: RawFd, t: &Termios) {
+    // SAFETY: `t` points at a live `termios` that the call only reads; an
+    // invalid fd or a non-terminal only makes the call fail.
+    unsafe {
+        libc::tcsetattr(fd, libc::TCSANOW, t);
     }
 }
 
@@ -210,5 +255,17 @@ mod tests {
         assert_eq!(send(&client, b"abc").unwrap(), 3);
         assert!(FdWriter(-1).write(b"x").is_err());
         assert!(read(-1, &mut [0u8; 1]).is_err());
+        assert!(io::Read::read(&mut FdReader(-1), &mut [0u8; 1]).is_err());
+    }
+
+    #[test]
+    fn terminal_calls_on_non_terminals() {
+        assert!(!isatty(-1));
+        assert!(tcgetattr(-1).is_none());
+        // Fails with EBADF; must not panic.
+        tcsetattr_now(-1, &zeroed_termios());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        assert!(!isatty(listener.as_raw_fd()));
+        assert!(tcgetattr(listener.as_raw_fd()).is_none());
     }
 }

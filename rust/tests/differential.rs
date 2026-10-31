@@ -3,7 +3,11 @@
 //! stdout and stderr byte for byte. Session cases also compare the bytes the
 //! client sent to the mock device port.
 //!
-//! Only mock servers on 127.0.0.1 are used.
+//! Only mock servers on 127.0.0.1 are used. Runs with `-c` connect to the
+//! fixed control port 6971; see the `control` module for the safety rule.
+
+#[path = "differential/control.rs"]
+mod control;
 
 use std::ffi::OsString;
 use std::fmt;
@@ -15,7 +19,7 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -25,6 +29,21 @@ const C_VERSION_LINE: &[u8] = b"version: novacom-ref-d9d8b77\n";
 const RUN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Poll interval of the mock server's accept loop and of child waits.
 const POLL: Duration = Duration::from_millis(5);
+
+/// On macOS, std marks new sockets and accepted connections close-on-exec
+/// with a second call, so a child spawned by another test thread in between
+/// inherits the fd. Fds whose leak would matter (the port 6971 listener and
+/// its connections, pty fds) are created under the write lock; children are
+/// spawned under the read lock.
+static FD_LOCK: RwLock<()> = RwLock::new(());
+
+fn spawn_lock() -> RwLockReadGuard<'static, ()> {
+    FD_LOCK.read().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn fd_create_lock() -> RwLockWriteGuard<'static, ()> {
+    FD_LOCK.write().unwrap_or_else(PoisonError::into_inner)
+}
 
 fn reference() -> PathBuf {
     let path = std::env::var_os("ROVACOM_REFERENCE").map_or_else(
@@ -187,9 +206,11 @@ fn run_io(
     if posix {
         cmd.env("POSIXLY_CORRECT", "1");
     }
-    let mut child = cmd
-        .spawn()
-        .unwrap_or_else(|e| panic!("spawn {}: {e}", bin.display()));
+    let spawned = {
+        let _spawn = spawn_lock();
+        cmd.spawn()
+    };
+    let mut child = spawned.unwrap_or_else(|e| panic!("spawn {}: {e}", bin.display()));
     let child_out = child.stdout.take().expect("stdout pipe");
     let out = match stdout {
         StdoutMode::Normal => spawn_reader(child_out),
@@ -301,12 +322,15 @@ fn list_basic_and_empty() {
     check(&[BASIC], &["-a", "127.0.0.1", "-p", "{P}", "-l"]);
     check(&[BASIC], &["-a", "localhost", "-p", "{P}", "-l"]);
     check(&[BASIC], &["-a", "127.1", "-p", "{P}", "-l"]);
+    // `-l` returns before any `-c` connection; port 6971 is held anyway.
+    let ctrl = control::CtrlMock::start(None);
     check(
         &[BASIC],
         &[
             "-ts", "-w", "-r", "pw", "-P", "-f", "1:2,3:4", "-c", "list", "-l", "-p", "{P}",
         ],
     );
+    assert!(ctrl.finish().is_empty());
 }
 
 #[test]
@@ -576,7 +600,6 @@ fn not_implemented_rust_only() {
     for (extra, what) in [
         (&["-t", "run", "file:///bin/true"][..], "terminal mode"),
         (&["-s", "run", "file:///bin/true"][..], "signal forwarding"),
-        (&["-c", "list"][..], "control command"),
         (&["-P"][..], "port forwarding"),
     ] {
         let mock = Mock::start(&[BASIC]);
