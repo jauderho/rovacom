@@ -827,3 +827,47 @@ fn relay_close_mid_body_rust_only() {
         format!("{}\n", report(247, closed_errno()))
     );
 }
+
+/// Intentional change: when `accept` fails (here `EMFILE`: with the fd
+/// limit at 4, the listener takes the last free fd), the service thread
+/// waits before it tries again. On Linux the connection stays queued, so C
+/// fails again at once, uses a full CPU and prints the error about 10^5
+/// times per second (macOS drops the connection: one error). rovacom only.
+#[test]
+fn relay_accept_error_backs_off() {
+    let _serial = RELAY_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let list = Mock::start(&[b"7000 n usb castle\n"]);
+    let port = free_port();
+    let mut args = vec![
+        b"-c".to_vec(),
+        b"ulimit -n 4 && exec \"$0\" \"$@\"".to_vec(),
+        rovacom().into_os_string().into_vec(),
+    ];
+    args.extend(argv(&["-a", "127.0.0.1", "-p", "{P}", "-P"], list.port));
+    args.extend(forward(&[(port, 22)]).into_iter().map(String::into_bytes));
+    let client = Client::spawn(
+        Path::new("/bin/sh"),
+        &args,
+        Stdio::null(),
+        Some(Stdio::null()),
+        false,
+    );
+    let deadline = Instant::now() + WAIT;
+    let _conn = loop {
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(c) => break c,
+            Err(e) => assert!(Instant::now() < deadline, "connect to relay: {e}"),
+        }
+        std::thread::sleep(POLL);
+    };
+    std::thread::sleep(IDLE);
+    client.kill(libc::SIGTERM);
+    let (_, _, err) = client.finish();
+    let err = String::from_utf8_lossy(&err);
+    let reports = err.matches(&report(273, libc::EMFILE)).count();
+    assert!(
+        (1..=20).contains(&reports),
+        "{reports} accept errors in {IDLE:?}; stderr starts: {:?}",
+        err.chars().take(200).collect::<String>()
+    );
+}

@@ -44,6 +44,10 @@ use crate::sys::{self, FdWriter, STDERR_FD, STDOUT_FD};
 const BUFFER_LEN: usize = 0x2000;
 /// C main thread: `for (;;) { sleep(100000); }`.
 const MAIN_SLEEP: Duration = Duration::from_secs(100_000);
+/// Wait after a failed `accept` before the next one. Intentional change: C
+/// tries again at once; on Linux a connection that `accept` could not take
+/// (e.g. `EMFILE`) stays queued, so C loops at full CPU.
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// Whether C `close` on a socket wakes another thread blocked in `recv` on
 /// it with `EBADF` (Darwin). On Linux the other thread stays blocked until
@@ -196,6 +200,7 @@ fn create_tunnel(relay: &Arc<Relay>, listener: &TcpListener, remote_port: i32) {
         Ok((s, _)) => s,
         Err(e) => {
             relay.report_error(line::ACCEPT, errno_of(&e));
+            std::thread::sleep(ACCEPT_RETRY_DELAY);
             return;
         }
     };

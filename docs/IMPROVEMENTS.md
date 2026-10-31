@@ -37,4 +37,4 @@ Status: `open` Â· `applied-in-port` (fixed as part of the port, see ASSESSMENT Â
 | I27 | Stability | B6 leaves the tty with only ECHO set (no ICANON/ISIG) between the prompt and exit; Ctrl-C does not work while waiting for the daemon | Restore the saved attributes instead of `&= ECHO` | None | open |
 | I28 | Security | SHA-1 auth hash computed over an unbounded `snprintf` buffer (B14) | Hash the full input | None | applied-in-port |
 | I29 | Maintenance | The port 6971 test guard intermittently refuses to run on macOS ("port 6971 accepts connections", about 3 in 20 runs during slice 5) with nothing found listening afterwards; cause unknown. Overlapping `cargo test` runs also trigger it (the lock is per process) | Find the cause; cross-process lock file (`flock`) | None (tests only; fails safe) | open |
-| I30 | Stability | Relay accept errors (e.g. EMFILE) make the service thread retry at once in a tight loop | Back off on accept errors | None | open |
+| I30 | Stability | Relay accept errors (e.g. EMFILE) make the service thread retry at once in a tight loop | Back off on accept errors | None | done (100 ms wait) |

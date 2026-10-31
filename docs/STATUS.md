@@ -23,7 +23,7 @@ Commands (run in `rust/`): `cargo fmt --check`, `cargo check --all-targets --loc
 | fmt / check / clippy `-D warnings` | executed, passed | executed, passed |
 | Full suite repeated | 4 full runs after slice 5, all passed | 6 full runs after slice 5; 1 failure (C reference flake, below), then 3 passed after the fix |
 | Unit tests | executed, 78 passed | executed, 77 passed (1 test is macOS-only) |
-| Differential tests vs C (mock novacomd, merged-stream, pty, signal and relay tests) | executed, 64 passed | executed, 64 passed |
+| Differential tests vs C (mock novacomd, merged-stream, pty, signal and relay tests) | executed, 65 passed | executed, 65 passed |
 | Known flaky reference | `signals_forwarded`: C drops signals under load (B4): 8 of 20 runs on a loaded 2-core host, rovacom 0 of 20. The test now retries the C side up to 5 times; rovacom runs once | same |
 | Port 6971 guard false refusals (I29) | about 3 in 20 runs during slice 5; fails safe; cause unknown | not seen |
 | Harness negative checks | slice 1: wrong reference fails 18 of 20; slices 2-5: 13 deliberate code mutations each caught; slice 3: tests refuse to run with a fake wildcard listener on 6971 | not executed |
@@ -86,6 +86,7 @@ Commands (run in `rust/`): `cargo fmt --check`, `cargo check --all-targets --loc
 | Device closes mid-packet | **intentionally changed** (B15): tunnel ends; C spins at ~100% CPU | same |
 | Closing one side of a tunnel | **intentionally changed** (B16): `shutdown` on shared sockets; output matches C (EBADF lines emulated) | **intentionally changed** (B16): peer sees FIN at once; C waits for the peer to act |
 | Relay listen address | **intentionally changed** (I3): 127.0.0.1 only; C listens on all interfaces | same |
+| Relay `accept` fails (e.g. EMFILE) | **intentionally changed** (I30): 100 ms wait before the next `accept`; the kernel drops the connection, so one error is logged (as C) | **intentionally changed** (I30): about 10 errors per second; the connection stays queued and C retries at once (rovacom before the fix: 184,974 errors in 1 s) |
 
 ## Remaining work before full replacement
 
