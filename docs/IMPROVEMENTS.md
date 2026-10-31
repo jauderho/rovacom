@@ -32,3 +32,7 @@ Status: `open` Â· `applied-in-port` (fixed as part of the port, see ASSESSMENT Â
 | I22 | Maintenance | Dead code: `base64.c`, `hexdump8`, `adler32/crc32` decls, `init_sockets` | Not ported | None | applied-in-port |
 | I23 | Stability | Oversized OOB packet arriving in parts overflows a static buffer (B13) | Discard extra bytes | None | applied-in-port |
 | I24 | Stability | rovacom resets SIGPIPE to default at startup; C inherits an ignored SIGPIPE from its parent | Inherit the parent disposition (needs a pre-main hook) if any caller depends on it | None | open |
+| I25 | Security | C zeroes the `-r` password in argv after hashing, so it disappears from `ps` once used; rovacom zeroes only its own copies, so the password stays visible in `ps` for the life of the process | Scrub argv (platform-specific) or prefer I1 (no password on the command line) | None | open (regression vs C) |
+| I26 | Security | Password echo is disabled only if both stdin and stdout are terminals (`setconsole` gives up if `tcgetattr(1)` fails): `rovacom -c login \| tee log` echoes the password | Disable echo on stdin (or `/dev/tty`) independently | None | open |
+| I27 | Stability | B6 leaves the tty with only ECHO set (no ICANON/ISIG) between the prompt and exit; Ctrl-C does not work while waiting for the daemon | Restore the saved attributes instead of `&= ECHO` | None | open |
+| I28 | Security | SHA-1 auth hash computed over an unbounded `snprintf` buffer (B14) | Hash the full input | None | applied-in-port |

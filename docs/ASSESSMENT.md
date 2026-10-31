@@ -171,6 +171,7 @@ No config files, no env vars, no runtime file paths. Only install layout comes f
 | B11 | `main.c:169` | `memset(&ti, …)` twice; `to` never cleared (overwritten by `tcgetattr`, harmless) |
 | B12 | `-c list` | Never reads the host list it requested |
 | B13 | `packet.c:172-176` | Oversized OOB packet whose extra bytes arrive in parts: `sizeof(m) - bodycounter` wraps, and `recv` writes past the static `m` (UB). Found in slice 2; rovacom discards those bytes |
+| B14 | `main.c:493-501` | `snprintf` of nduid ‖ password into the 4096-byte `command` buffer, then SHA-1 over the untruncated length: inputs over 4095 bytes read past the buffer (UB). Found in slice 3; rovacom hashes the full input |
 
 ## 5. Proposed Rust module map
 
@@ -192,7 +193,7 @@ Single Cargo package `rust/`, crate `rovacom` (binary `rovacom` + internal lib f
 | Crate | Purpose | License | Notes |
 |---|---|---|---|
 | `libc` | termios, `ioctl(TIOCGWINSZ)`, `sigaction`, `poll`, `fcntl`, `pipe` | MIT/Apache-2.0 | Thin FFI; all `unsafe` confined to `sys/unix.rs`. Links only system libc (glibc / libSystem). No extra native deps |
-| `sha1` (RustCrypto) | SHA-1 for auth hash | MIT/Apache-2.0 | Alternative: port the 400-line `sha1.c` (keeps NOTICE terms). Recommend crate; verified by test vectors against C output |
+| `sha1` (RustCrypto) | SHA-1 for auth hash | MIT/Apache-2.0 | Chosen: 0.11.0, `default-features = false`. Verified against `shasum` vectors and C output |
 
 Not used: `clap` (cannot reproduce getopt output byte-for-byte), `tokio`, `nix`/`rustix` (extra surface for ~8 syscalls), any USB crate.
 Exact versions recorded when added.
@@ -237,3 +238,9 @@ Improvement ideas found during the port are tracked in [IMPROVEMENTS.md](IMPROVE
 ## 9. Real-device testing
 
 A Palm Pre3 (last known working unit) will be connected to the macOS host later. Device sessions are read-only by default, every command is approved by the user first, and all fuzz, malformed-packet and stress tests run against mock peers only.
+
+## 10. Behaviors found during porting
+
+- **Session id carry-over with `-w` (slice 3):** C keeps the session id of a matched device in a global (`devsnid`) that only a later match with a non-empty session id overwrites. With `-w`, a match with a negative port leaves its session id behind for a later match. Emulated.
+- **macOS PENDIN (slice 3):** after B6 clears ICANON, `resetconsole` turns canonical mode back on and the BSD kernel sets PENDIN on the tty. Both C and rovacom leave PENDIN set. Not seen on Linux.
+- **Password prompt visibility (slice 3):** with stdout a pipe the prompt appears after stderr messages; with stdout a tty but stdin not, the prompt appears only after the read; with stdin a tty but stdout not, echo stays on. All emulated.
