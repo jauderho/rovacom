@@ -29,8 +29,9 @@ Commands (run in `rust/`): `cargo fmt --check`, `cargo check --all-targets --loc
 | Harness negative checks | slice 1: wrong reference fails 18 of 20; slices 2-5: 13 deliberate code mutations each caught; slice 3: tests refuse to run with a fake wildcard listener on 6971 | not executed |
 | CI workflow (`.github/workflows/rust.yml`) | proposed, **never run** | proposed, **never run** |
 | Linux arm64, macOS x86_64 | not executed (CI jobs proposed) | not executed |
-| Real novacomd / rovacomd | blocked: none available | blocked: none available |
-| Real device (Palm Pre3) | blocked: not yet connected | n/a |
+| Real novacomd (upstream 530a103, built for macOS with `scripts/patches/novacomd-macos.patch`, run as the user, no device) | executed 2026-10-31: `-l` (empty list, exit 0) and device lookup (`unable to find device`, exit 1) match the C client | not executed |
+| rovacomd | blocked: not written yet | blocked |
+| Real device (Palm Pre3) | blocked: plugged in, but never seen on the Mac's USB bus (3 cable/port attempts) | n/a |
 
 ## Compatibility matrix
 
