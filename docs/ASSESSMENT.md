@@ -170,6 +170,7 @@ No config files, no env vars, no runtime file paths. Only install layout comes f
 | B10 | `main.c:504,517` | `%.*s` given `size_t` (works on LP64 by ABI accident) |
 | B11 | `main.c:169` | `memset(&ti, …)` twice; `to` never cleared (overwritten by `tcgetattr`, harmless) |
 | B12 | `-c list` | Never reads the host list it requested |
+| B13 | `packet.c:172-176` | Oversized OOB packet whose extra bytes arrive in parts: `sizeof(m) - bodycounter` wraps, and `recv` writes past the static `m` (UB). Found in slice 2; rovacom discards those bytes |
 
 ## 5. Proposed Rust module map
 
@@ -225,7 +226,7 @@ Note: `make BUILDVERSION=x` (command-line) breaks the build because it bypasses 
 
 ## 8. Decisions (proposed defaults, adopted 2026-10-30; change on user request)
 
-1. **Bugs:** keep deterministic quirks (B3, B6, B11, B12, error texts). Fix unsafe or nondeterministic defects and list each as "intentionally changed": B1 (reject over-long command instead of overflow), B2 (`EAGAIN` → no data), B4 (never drop signals), B5 (zero padding), B7 (full writes), B8 (parse error instead of crash), B9 (no uninitialized print), B10.
+1. **Bugs:** keep deterministic quirks (B3, B6, B11, B12, error texts). Fix unsafe or nondeterministic defects and list each as "intentionally changed": B1 (send the full command with no length limit; C overflows its 4096-byte buffer), B2 (`EAGAIN` → no data), B4 (never drop signals), B5 (zero padding), B7 (full writes), B8 (parse error instead of crash), B9 (no uninitialized print), B10.
 2. **getopt diagnostics:** emulate each OS's libc text exactly, with `rovacom` as the program name.
 3. **macOS `-t` NUL-as-INTR (P2):** preserved and documented; see IMPROVEMENTS.md I7.
 4. **Version:** `version: rovacom-<CARGO_PKG_VERSION>`, overridable by `BUILDVERSION` at build time.

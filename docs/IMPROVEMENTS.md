@@ -13,7 +13,7 @@ Status: `open` Â· `applied-in-port` (fixed as part of the port, see ASSESSMENT Â
 | I3 | Security | Port forwarding listens on `INADDR_ANY` (`socket.c:create_listen_socket`) â€” exposes device services to the LAN | Bind `127.0.0.1` by default; opt-in flag for all interfaces | None | open |
 | I4 | Security | Server traffic is plaintext TCP; `-a` to a remote host sends password hashes and streams unencrypted | Recommend SSH tunnel; consider refusing non-loopback `-a` without a flag | None | open |
 | I5 | Security | Uninitialized OOB padding sent on wire (B5) | Zero padding | Bytes only in reserved field | applied-in-port |
-| I6 | Security | Stack/global overflow building command from argv (B1) | Bounds check | None | applied-in-port |
+| I6 | Security | Global buffer overflow building command from argv (B1) | Build the command without a fixed buffer (no length limit) | None | applied-in-port |
 | I7 | Stability | macOS `-t` sets VINTR/VQUIT/VSUSP to `'\0'`, which is not `_POSIX_VDISABLE` (255) on macOS: Ctrl-@ interrupts locally | Use `_POSIX_VDISABLE` | None | open |
 | I8 | Stability | Death by signal (no `-s`) leaves tty raw: restore only via `atexit` | Restore termios in a guard + on fatal signals | None | open |
 | I9 | Stability | False "socket closed" on `EAGAIN` between header and body (B2) | Treat `EAGAIN` as no data | None | applied-in-port |
@@ -25,8 +25,10 @@ Status: `open` Â· `applied-in-port` (fixed as part of the port, see ASSESSMENT Â
 | I15 | Stability | IPv4 only via deprecated `gethostbyname` (`socket.c:86`) | `getaddrinfo`, try all addresses, IPv6 | None | open |
 | I16 | Stability | Relay crash on odd `-f` list (B8); relay leaks listening sockets and never exits | Parse errors; clean shutdown on SIGINT | None | applied-in-port (B8) / open |
 | I17 | Performance | Device list read 1 byte per `recv` syscall (`read_line`) | Buffered reader (must not over-read into the next protocol phase on the same socket) | None | open |
-| I18 | Performance | `select` with a 5 ms timeout busy-polls while stdin is open (`data_xfer`) | Block in `poll` without timeout | None | open |
+| I18 | Performance | `select` with a 5 ms timeout busy-polls while stdin is open, and a zero timeout spins at 100% CPU when stdin is not watched (`data_xfer`) | Block without timeout. rovacom already blocks when stdin is not watched; the 5 ms poll remains | None | partly applied-in-port |
 | I19 | Performance | stdin read in 4 KiB chunks, one packet per `send`; relay sends header and body as 2 syscalls | Larger chunks (peer max permitting), `writev` | Packet sizes only | open |
 | I20 | Performance | Relay uses 2 OS threads per tunnel + 1 per port | Fine at this scale; revisit only if needed | None | open |
 | I21 | Maintenance | Host-endian wire format with no explicit byte order | rovacom encodes explicit little-endian (same bytes on all targets) | None | applied-in-port |
 | I22 | Maintenance | Dead code: `base64.c`, `hexdump8`, `adler32/crc32` decls, `init_sockets` | Not ported | None | applied-in-port |
+| I23 | Stability | Oversized OOB packet arriving in parts overflows a static buffer (B13) | Discard extra bytes | None | applied-in-port |
+| I24 | Stability | rovacom resets SIGPIPE to default at startup; C inherits an ignored SIGPIPE from its parent | Inherit the parent disposition (needs a pre-main hook) if any caller depends on it | None | open |

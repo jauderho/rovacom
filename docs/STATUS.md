@@ -1,6 +1,6 @@
 # rovacom: Compatibility Matrix and Verification Report
 
-Last updated: 2026-10-30. Slice 1 (device listing) complete.
+Last updated: 2026-10-30. Slices 1 (device listing) and 2 (remote command data stream, no tty) complete.
 
 ## Validation runs
 
@@ -8,6 +8,7 @@ Last updated: 2026-10-30. Slice 1 (device listing) complete.
 |---|---|---|
 | Host | MacBook Air, macOS 27.2 (26B123), arm64 | a010, Ubuntu 26.10, kernel 7.3.0, x86_64, glibc 2.44 |
 | Rust | rustc 1.99.1 (58cf8f9c3 2026-10-13) stable | rustc 1.99.1 (58cf8f9c3 2026-10-13) stable |
+| Dependencies | libc 0.2.191 (MIT OR Apache-2.0) | same |
 | C reference | `scripts/build-reference.sh` (Apple clang 21.0.0), commit d9d8b77 | same script (gcc 15.3.0) |
 
 Commands (run in `rust/`): `cargo fmt --check`, `cargo check --all-targets --locked`,
@@ -18,9 +19,9 @@ Commands (run in `rust/`): `cargo fmt --check`, `cargo check --all-targets --loc
 | Item | macOS | Linux |
 |---|---|---|
 | fmt / check / clippy `-D warnings` | executed, passed | executed, passed |
-| Unit tests | executed, 37 passed | executed, 36 passed (1 test is macOS-only) |
-| Differential tests vs C (mock novacomd) | executed, 20 passed | executed, 20 passed |
-| Harness negative check (`ROVACOM_REFERENCE=/bin/echo`) | executed, 18 of 20 fail as expected (2 are Rust-only cases) | not executed |
+| Unit tests | executed, 59 passed (2 full runs) | executed, 58 passed (2 full runs; 1 test is macOS-only) |
+| Differential tests vs C (mock novacomd) | executed, 38 passed (2 full runs) | executed, 38 passed (2 full runs) |
+| Harness negative checks | slice 1: wrong reference fails 18 of 20; slice 2: 3 deliberate code mutations each caught | not executed |
 | CI workflow (`.github/workflows/rust.yml`) | proposed, **never run** | proposed, **never run** |
 | Linux arm64, macOS x86_64 | not executed (CI jobs proposed) | not executed |
 | Real novacomd / rovacomd | blocked: none available | blocked: none available |
@@ -44,18 +45,28 @@ Commands (run in `rust/`): `cargo fmt --check`, `cargo check --all-targets --loc
 | `-w` wait-and-retry | preserved, verified | preserved, verified |
 | `-f` parsing | preserved, verified | preserved, verified |
 | `-f` with odd / empty token list | **intentionally changed** (B8): error + usage instead of segfault | same |
-| Write to closed stdout pipe | **differs, open**: C dies by SIGPIPE; Rust ignores SIGPIPE and exits normally. Fix in the `sys` slice (needs `libc`) | same |
-| Remote command execution (`run …`, data stream) | unsupported in this build (exit 70) | same |
+| Write to closed stdout pipe (incl. `-l`) | preserved, verified (killed by signal 13) | same |
+| SIGPIPE inherited as ignored from parent | **differs**: rovacom always resets to default (I24) | same |
+| Remote command: command line, `ok` / `req:auth` / `unrecognized command` / other responses | preserved, verified | same |
+| Command longer than 4095 bytes | **intentionally changed** (B1): sent in full; C overflows | same |
+| Packet framing: stdin upload, stdout/stderr download, binary and NUL bytes, 10 MiB each way | preserved, verified | same |
+| RETURN codes (0, 1, 255, 256, -1) and `novacom: unexpected EOF from server` | preserved, verified | same |
+| Malformed peer data: bad magic/version, unknown type, zero-size DATA (B3 kept), OOB size 0/8/24, unknown OOB, peer SIGNAL/RESIZE, disconnect mid-header/body | preserved, verified | same |
+| Header and body in separate TCP segments | **intentionally changed** (B2): C fails with "closed prematurely" (observed 3/3 on macOS); rovacom waits | same (C failure not checked on Linux) |
+| OOB padding bytes | **intentionally changed** (B5): zero; C sends heap garbage | same |
+| Short writes to stdout/stderr | **intentionally changed** (B7): full writes | same |
+| Oversized OOB arriving in parts | **intentionally changed** (B13): extra bytes discarded; C has UB | same |
+| `unable to send command to server` path | implemented, unverified (no deterministic trigger) | same |
+| Started with fd 0/1/2 closed | **differs**: Rust runtime reopens them as `/dev/null` | same |
 | `-c` control commands and auth | unsupported in this build (exit 70) | same |
-| `-t` / `-s` terminal and signals | unsupported in this build | same |
+| `-t` / `-s` terminal and signals | unsupported in this build (exit 70) | same |
 | `-P` port forwarding | unsupported in this build (exit 70) | same |
 
 ## Remaining work before full replacement
 
-1. Slice 2: packet codec + non-tty data stream (`run`, binary stdin/stdout, EOF, RETURN code, malformed packets).
-2. Slice 3: `-c` control commands and SHA-1 auth.
-3. Slice 4: `sys` module (`libc`): termios `-t`, signal forwarding `-s`, SIGWINCH resize, SIGPIPE default.
-4. Slice 5: `-P` / `-f` port forwarding relay.
-5. Run CI on real runners; Linux arm64 and macOS x86_64 coverage.
-6. Interop with `rovacomd` and, with approval, read-only tests against the Pre3.
-7. Phase 5 build and deployment docs, including `novacom` alias setup without system-wide install.
+1. Slice 3: `-c` control commands and SHA-1 auth.
+2. Slice 4: termios `-t`, signal forwarding `-s`, SIGWINCH resize (extends `sys`).
+3. Slice 5: `-P` / `-f` port forwarding relay.
+4. Run CI on real runners; Linux arm64 and macOS x86_64 coverage.
+5. Interop with `rovacomd` and, with approval, read-only tests against the Pre3.
+6. Phase 5 build and deployment docs, including `novacom` alias setup without system-wide install.
