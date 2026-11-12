@@ -113,7 +113,7 @@ fn sha1_hex(data: &[u8]) -> [u8; 40] {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let digest = Sha1::digest(data);
     let mut out = [0u8; 40];
-    for (pair, b) in out.chunks_exact_mut(2).zip(digest.iter()) {
+    for (pair, b) in out.as_chunks_mut::<2>().0.iter_mut().zip(digest.iter()) {
         pair[0] = HEX[usize::from(b >> 4)];
         pair[1] = HEX[usize::from(b & 0x0f)];
     }

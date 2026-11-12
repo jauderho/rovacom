@@ -83,10 +83,10 @@ fn run_parsed(opts: Options, argv0: &[u8], out: &mut dyn Write, err: &mut dyn Wr
         }
         let found = devlist::find_device(&mut reader, &opts.device);
         drop(reader); // C closes the device-list socket here.
-        if let Some(d) = &found {
-            if !d.session.is_empty() {
-                session.clone_from(&d.session);
-            }
+        if let Some(d) = &found
+            && !d.session.is_empty()
+        {
+            session.clone_from(&d.session);
         }
         match found {
             Some(d) if d.port >= 0 => break FoundDevice { session, ..d },

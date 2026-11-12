@@ -549,7 +549,7 @@ const SIGNAL_SETTLE: Duration = Duration::from_millis(200);
 /// pipe" one or more times and forwards none of them.
 #[test]
 fn signals_while_blocked_rust_only() {
-    let data: Vec<u8> = (0..BLOCKING_STDIN).map(|i| (i % 253) as u8).collect();
+    let data: Vec<u8> = Vec::from_fn(BLOCKING_STDIN, |i| (i % 253) as u8);
     let file = StdinFile::new(&data);
     let stdin = File::open(&file.0).expect("open stdin file");
     // Shares the file offset with the child's stdin.

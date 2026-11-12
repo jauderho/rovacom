@@ -1075,7 +1075,7 @@ fn session_upload_10mib() {
 #[test]
 fn session_download_10mib_slow_consumer() {
     let total = 10 * 1024 * 1024usize;
-    let data: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+    let data: Vec<u8> = Vec::from_fn(total, |i| (i % 251) as u8);
     let mut stream = Vec::new();
     // Packet sizes vary, including some larger than the 64 KiB receive buffer.
     for (i, chunk) in data.chunks(100_000).enumerate() {
@@ -1314,7 +1314,7 @@ fn session_responses() {
 
 #[test]
 fn session_many_operands() {
-    let ops: Vec<String> = (0..300).map(|i| format!("arg{i}")).collect();
+    let ops: Vec<String> = Vec::from_fn(300, |i| format!("arg{i}"));
     let mut cmd: Vec<&str> = vec!["run", "file:///bin/echo"];
     cmd.extend(ops.iter().map(String::as_str));
     cmd.push("");

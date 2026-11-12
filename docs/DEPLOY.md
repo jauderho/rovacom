@@ -10,7 +10,7 @@ Verified on 2026-10-31 with rustc 1.99.1 on macOS 27.2 (arm64) and Ubuntu 26.10 
 
 | | Linux | macOS |
 |---|---|---|
-| Rust | stable, 1.85 or newer (edition 2024), via [rustup](https://rustup.rs) in your home directory | same |
+| Rust | stable, 1.100 or newer (edition 2024), via [rustup](https://rustup.rs) in your home directory | same |
 | C compiler, `make`, `git` | only to build the C reference for the tests (`gcc`, `make`, `git` packages) | only for the tests: Xcode Command Line Tools (`xcode-select --install`) |
 | Daemon | a running `novacomd` or `rovacomd` on the same host (or reachable over TCP) | same |
 | Native libraries | none beyond the C library (glibc) | none beyond the system (`libSystem`) |

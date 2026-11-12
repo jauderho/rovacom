@@ -431,7 +431,7 @@ fn round_trip_case(bin: &Path) -> CaseResult {
             let command = conn.command.clone();
             c.write_all(b"hello").expect("write");
             let (small, _) = upload(&mut conn, 5);
-            let big: Vec<u8> = (0..2 * CHUNK + 100).map(|i| (i % 251) as u8).collect();
+            let big: Vec<u8> = Vec::from_fn(2 * CHUNK + 100, |i| (i % 251) as u8);
             c.write_all(&big).expect("write");
             let (up, sizes) = upload(&mut conn, big.len());
             assert!(sizes.iter().all(|&n| (1..=CHUNK).contains(&n)), "{sizes:?}");
@@ -441,7 +441,7 @@ fn round_trip_case(bin: &Path) -> CaseResult {
             conn.send(&hdr(MAGIC, 1, 0, T_OOB));
             conn.send(&pkt(T_DATA, b"after"));
             let down2 = read_n(&mut c, 5);
-            let big_down: Vec<u8> = (0..3 * CHUNK + 7).map(|i| (i % 241) as u8).collect();
+            let big_down: Vec<u8> = Vec::from_fn(3 * CHUNK + 7, |i| (i % 241) as u8);
             conn.send(&pkt(T_DATA, &big_down));
             let down3 = read_n(&mut c, big_down.len());
             conn.send(&oob(OOB_EOF, 0));
