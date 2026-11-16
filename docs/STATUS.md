@@ -1,13 +1,13 @@
 # rovacom: Compatibility Matrix and Verification Report
 
-Last updated: 2026-10-30. Slices 1 (device listing), 2 (remote command data stream), 3 (`-c` control commands, password prompt), 4 (`-t` terminal mode, `-s` signal forwarding) and 5 (`-P` port forwarding) complete. All C functionality is ported.
+Last updated: 2026-11-16. Slices 1 (device listing), 2 (remote command data stream), 3 (`-c` control commands, password prompt), 4 (`-t` terminal mode, `-s` signal forwarding) and 5 (`-P` port forwarding) complete. All C functionality is ported.
 
 ## Validation runs
 
 | | macOS | Linux |
 |---|---|---|
 | Host | MacBook Air, macOS 27.2 (26B123), arm64 | a010, Ubuntu 26.10, kernel 7.3.0, x86_64, glibc 2.44 |
-| Rust | rustc 1.99.1 (58cf8f9c3 2026-10-13) stable | rustc 1.99.1 (58cf8f9c3 2026-10-13) stable |
+| Rust | rustc 1.100.0 (0ef1bc386 2026-11-09) stable; slices 1-5 were verified on 1.99.1 | same |
 | Dependencies | libc 0.2.191; sha1 0.11.0 (+ block-buffer, cfg-if, cpufeatures, crypto-common, digest, hybrid-array, typenum); all MIT OR Apache-2.0 | same |
 | C reference | `scripts/build-reference.sh` (Apple clang 21.0.0), commit d9d8b77 | same script (gcc 15.3.0) |
 
@@ -21,6 +21,7 @@ Commands (run in the repository root): `cargo fmt --check`, `cargo check --all-t
 | Item | macOS | Linux |
 |---|---|---|
 | fmt / check / clippy `-D warnings` | executed, passed | executed, passed |
+| Rust 1.100.0 rerun (2026-11-12, after the 1.100 changes) | executed: fmt, clippy, 78 unit + 65 differential passed | executed: fmt, clippy, 77 unit + 65 differential passed |
 | Full suite repeated | 4 full runs after slice 5, all passed | 6 full runs after slice 5; 1 failure (C reference flake, below), then 3 passed after the fix |
 | Unit tests | executed, 78 passed | executed, 77 passed (1 test is macOS-only) |
 | Differential tests vs C (mock novacomd, merged-stream, pty, signal and relay tests) | executed, 65 passed | executed, 65 passed |
@@ -30,8 +31,8 @@ Commands (run in the repository root): `cargo fmt --check`, `cargo check --all-t
 | CI workflow (`.github/workflows/rust.yml`) | proposed, **never run** | proposed, **never run** |
 | Linux arm64, macOS x86_64 | not executed (CI jobs proposed) | not executed |
 | Real novacomd (upstream 530a103, built for macOS with `scripts/patches/novacomd-macos.patch`, run as the user, no device) | executed 2026-10-31: `-l` (empty list, exit 0) and device lookup (`unable to find device`, exit 1) match the C client | not executed |
-| rovacomd | blocked: not written yet | blocked |
-| Real device (Palm Pre3) | blocked: plugged in, but never seen on the Mac's USB bus (3 cable/port attempts) | n/a |
+| rovacomd | executed: all pairings with a fake inet device pass in rovacomd's tests (see rovacomd `docs/STATUS.md`) | same |
+| Real device (Palm Pre3) | blocked: plugged in, but never seen on the Mac's USB bus (5 cable/port attempts); on wifi, all probed TCP ports are filtered | n/a |
 
 ## Compatibility matrix
 
